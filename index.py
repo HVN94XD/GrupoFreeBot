@@ -183,7 +183,7 @@ def cmd_desautorizar(message):
         bot.send_message(STORAGE_CHAT_ID, f"🚫 #SUBADMIN_REVOCADO\nID: {target_id}\nPor: {message.from_user.id}")
     except Exception:
         pass
-    bot.send_message(message.chat.id, f"🚫 Permisos de Sub-Admin revocados para `{target_id}`.", parse_mode="Markdown")
+    bot.send_message(message.chat.id, f"🚫 Permisos revocados para `{target_id}`.", parse_mode="Markdown")
 
 @bot.message_handler(commands=['reset_claims'])
 def cmd_reset_claims(message):
@@ -208,10 +208,10 @@ def cmd_free(message):
 
     markup = types.InlineKeyboardMarkup(row_width=1)
 
-    # 1. EN GRUPOS: JAMÁS MOSTRAR PANEL ADMIN, SOLO BOTÓN DE CANJES
+    # 1. EN GRUPOS PÚBLICOS: SOLO BOTÓN DE CANJES
     if chat_id < 0 and chat_id != STORAGE_CHAT_ID:
         markup.add(types.InlineKeyboardButton("🎁 ┃ VER LISTAS DISPONIBLES", callback_data="btn_cuentas_free"))
-    # 2. EN PRIVADO: MOSTRAR SEGÚN ROL
+    # 2. EN PRIVADO: PANEL SEGÚN ROL
     else:
         if es_admin(user_id):
             markup.add(
@@ -245,8 +245,7 @@ def cmd_free(message):
             bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
     except Exception:
         bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
-
-# --- PROCESAMIENTO DE ARCHIVOS (SOLO PRIVADO O STORAGE) ---
+# --- PROCESAMIENTO DE ARCHIVOS Y RECICLAJE/REENVÍOS ---
 @bot.message_handler(content_types=['document'])
 def procesar_archivos_y_reenvios(message):
     chat_id = message.chat.id
@@ -255,7 +254,6 @@ def procesar_archivos_y_reenvios(message):
     if not validar_seguridad_chat(chat_id):
         return
 
-    # Bloquear carga de documentos en grupos públicos
     if chat_id < 0 and chat_id != STORAGE_CHAT_ID:
         return
 
@@ -288,13 +286,12 @@ def procesar_archivos_y_reenvios(message):
             return
 
         if not lineas:
-            bot.send_message(chat_id, "⚠️ El archivo reenviado no contiene líneas válidas.")
+            bot.send_message(chat_id, "⚠️ El archivo no contiene líneas válidas.")
             return
 
         with lock_db:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
-            
             cursor.execute("SELECT id FROM lists WHERE name = ?", (nombre_cat,))
             res_l = cursor.fetchone()
             
@@ -395,7 +392,7 @@ def procesar_archivos_y_reenvios(message):
             reply_markup=markup
         )
 
-# --- FLUJOS DE TEXTO ---
+# --- FLUJOS DE TEXTO Y CANJES ---
 @bot.message_handler(content_types=['text'])
 def procesar_mensajes_texto(message):
     chat_id = message.chat.id
@@ -405,9 +402,20 @@ def procesar_mensajes_texto(message):
         return
 
     texto_ingresado = message.text.strip().upper()
-    
-    # 1. Canje directo si pega una key
-    if "-" in texto_ingresado and len(texto_ingresado) >= 12 and user_id not in USER_STATE:
+    estado = USER_STATE.get(user_id, {})
+    paso = estado.get("paso")
+
+    # 1. CANJE DIRECTO SI PEGA UNA KEY O ESTÁ EN ESTADO esperando_key
+    if paso == "esperando_key" or ("-" in texto_ingresado and len(texto_ingresado) >= 12):
+        if chat_id < 0:
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
+
+        if user_id in USER_STATE:
+            del USER_STATE[user_id]
+
         with lock_db:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -420,63 +428,58 @@ def procesar_mensajes_texto(message):
             """, (texto_ingresado,))
             res_key = cursor.fetchone()
 
-            if res_key:
-                k_id, list_id, l_name, line_num, line_txt, p_code, claimed = res_key
-
-                if chat_id < 0:
-                    try:
-                        bot.delete_message(chat_id, message.message_id)
-                    except Exception:
-                        pass
-
-                cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
-                if cursor.fetchone():
-                    conn.close()
-                    enviar_temporal(chat_id, f"❌ @{message.from_user.username or 'Usuario'}, ya reclamaste en la categoría {l_name}.")
-                    return
-
-                if claimed == 1:
-                    conn.close()
-                    enviar_temporal(chat_id, "❌ Esta Key ya fue utilizada.")
-                    return
-
-                cursor.execute("UPDATE keys SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, k_id))
-                cursor.execute("INSERT INTO claims (user_id, list_id, key_id) VALUES (?, ?, ?)", (user_id, list_id, k_id))
-                conn.commit()
+            if not res_key:
                 conn.close()
-
-                try:
-                    bot.send_message(
-                        STORAGE_CHAT_ID,
-                        f"🎟 #CANJE_REGISTRADO\n"
-                        f"🏷 Pack: #{p_code}\n"
-                        f"🔑 Key: {texto_ingresado}\n"
-                        f"📍 Línea: #{line_num}\n"
-                        f"👤 Usuario: @{message.from_user.username or 'Anon'} ({user_id})"
-                    )
-                except Exception:
-                    pass
-
-                try:
-                    bot.send_message(user_id, f"🎉 CANJE EXITOSO - {l_name}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato:\n\n{line_txt}")
-                    if chat_id < 0:
-                        enviar_temporal(chat_id, f"✅ @{message.from_user.username or 'Usuario'}, te enviamos tu dato por **Mensaje Privado** 📩")
-                except Exception:
-                    enviar_temporal(chat_id, f"⚠️ Inicia el bot por privado (@GrupoFreeBot) para poder enviarte tu cuenta.")
+                enviar_temporal(chat_id, f"❌ Key inválida o no registrada.")
                 return
+
+            k_id, list_id, l_name, line_num, line_txt, p_code, claimed = res_key
+
+            # Validar si ya reclamó en esta lista
+            cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
+            if cursor.fetchone():
+                conn.close()
+                enviar_temporal(chat_id, f"❌ @{message.from_user.username or 'Usuario'}, ya reclamaste en la categoría {l_name}.")
+                return
+
+            if claimed == 1:
+                conn.close()
+                enviar_temporal(chat_id, "❌ Esta Key ya fue utilizada.")
+                return
+
+            # Canjear
+            cursor.execute("UPDATE keys SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, k_id))
+            cursor.execute("INSERT INTO claims (user_id, list_id, key_id) VALUES (?, ?, ?)", (user_id, list_id, k_id))
+            conn.commit()
             conn.close()
 
-    # Bloquear flujos de administración si se ejecutan dentro de un grupo
-    if chat_id < 0:
+            # Notificar al Storage
+            try:
+                bot.send_message(
+                    STORAGE_CHAT_ID,
+                    f"🎟 #CANJE_REGISTRADO\n"
+                    f"🏷 Pack: #{p_code}\n"
+                    f"🔑 Key: {texto_ingresado}\n"
+                    f"📍 Línea: #{line_num}\n"
+                    f"👤 Usuario: @{message.from_user.username or 'Anon'} ({user_id})"
+                )
+            except Exception:
+                pass
+
+            # Entrega directa al privado
+            try:
+                bot.send_message(user_id, f"🎉 CANJE EXITOSO - {l_name}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato (Línea #{line_num}):\n\n{line_txt}")
+                if chat_id < 0:
+                    enviar_temporal(chat_id, f"✅ @{message.from_user.username or 'Usuario'}, tu cuenta fue entregada por **Privado** 📩")
+            except Exception:
+                enviar_temporal(chat_id, f"⚠️ @{message.from_user.username or 'Usuario'}, inicia el bot por privado (@GrupoFreeBot) para recibir tu cuenta.")
+            return
+
+    # 2. ACCIONES DE ADMINISTRACIÓN (SOLO PRIVADO)
+    if chat_id < 0 or user_id not in USER_STATE:
         return
 
-    if user_id not in USER_STATE:
-        return
-
-    estado = USER_STATE.get(user_id, {})
-    paso = estado.get("paso")
-
-    # Autorizar Sub-Admin (Solo en Privado)
+    # Autorizar Sub-Admin
     if paso == "esperando_subadmin_id":
         if not es_admin(user_id):
             return
@@ -503,7 +506,7 @@ def procesar_mensajes_texto(message):
         bot.send_message(chat_id, f"✅ Sub-Admin {target_id} autorizado exitosamente.")
         return
 
-    # Nombre de lista nueva (Solo en Privado)
+    # Nombre de lista nueva
     elif paso == "esperando_nombre":
         if not es_subadmin(user_id):
             return
@@ -534,7 +537,7 @@ def procesar_mensajes_texto(message):
         bot.send_message(chat_id, f"✅ Lista: {nombre_cat}\n🏷 ID: #{pack_code}\n\nEnvía tu archivo .txt o pega las líneas:")
         return
 
-    # Guardar líneas por texto (Solo en Privado)
+    # Guardar líneas por texto
     elif paso == "esperando_lineas":
         list_id = estado.get("list_id")
         nombre_cat = estado.get("nombre")
@@ -592,62 +595,7 @@ def procesar_mensajes_texto(message):
         )
         return
 
-    # Canje por estado
-    elif paso == "esperando_key":
-        list_id = estado.get("list_id")
-        categoria = estado.get("categoria")
-        key_ingresada = message.text.strip().upper()
-        del USER_STATE[user_id]
-
-        with lock_db:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-
-            cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
-            if cursor.fetchone():
-                conn.close()
-                enviar_temporal(chat_id, f"❌ Ya reclamaste una key en la categoría {categoria}.")
-                return
-
-            cursor.execute("""
-                SELECT k.id, l.line_number, l.line_text, li.pack_code 
-                FROM keys k 
-                JOIN lines l ON k.line_id = l.id 
-                JOIN lists li ON k.list_id = li.id
-                WHERE k.key_value = ? AND k.list_id = ? AND k.claimed = 0
-            """, (key_ingresada, list_id))
-            key_data = cursor.fetchone()
-
-            if not key_data:
-                conn.close()
-                enviar_temporal(chat_id, f"❌ Key inválida, ya utilizada o no pertenece a {categoria}.")
-                return
-
-            k_id, line_num, linea_entregada, pack_code = key_data
-            cursor.execute("UPDATE keys SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, k_id))
-            cursor.execute("INSERT INTO claims (user_id, list_id, key_id) VALUES (?, ?, ?)", (user_id, list_id, k_id))
-            conn.commit()
-            conn.close()
-
-        try:
-            bot.send_message(
-                STORAGE_CHAT_ID,
-                f"🎟 #CANJE_REGISTRADO\n"
-                f"🏷 Pack: #{pack_code}\n"
-                f"🔑 Key: {key_ingresada}\n"
-                f"📍 Línea: #{line_num}\n"
-                f"👤 Usuario: @{message.from_user.username or 'Anon'} ({user_id})"
-            )
-        except Exception:
-            pass
-
-        try:
-            bot.send_message(user_id, f"🎉 CANJE EXITOSO - {categoria}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato:\n\n{linea_entregada}")
-        except Exception:
-            pass
-        return
-
-# --- CALLBACKS Y GESTIÓN DE ROLES ---
+# --- CALLBACKS Y BOTONES ---
 @bot.callback_query_handler(func=lambda call: True)
 def router_callbacks(call):
     user_id = call.from_user.id
@@ -658,7 +606,7 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id, "No tienes acceso a este bot.", show_alert=True)
         return
 
-    # Bloquear acciones de administración si el callback viene de un grupo público
+    # Bloquear acciones de administración en grupos
     if chat_id < 0 and data not in ["btn_cuentas_free", "btn_volver_inicio"] and not data.startswith("pedir_key_"):
         bot.answer_callback_query(call.id, "⚠️ El panel de administración solo funciona en chat privado.", show_alert=True)
         return
@@ -861,7 +809,7 @@ def router_callbacks(call):
             txt_k = "\n".join(keys_generadas)
             bot.send_message(chat_id, f"🔑 {len(keys_generadas)} Keys de {l_name}:\n\n{txt_k}")
 
-    # Menú de Canje
+    # Menú de Canje Público
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
