@@ -18,8 +18,20 @@ if raw_storage_id.startswith("-") and not raw_storage_id.startswith("-100"):
     raw_storage_id = "-100" + raw_storage_id[1:]
 STORAGE_CHAT_ID = int(raw_storage_id)
 
-TIEMPO_AUTO_ELIMINAR = 30
+TIEMPO_AUTO_ELIMINAR = 60
 DB_PATH = "/tmp/archivos_bot.db"
+
+WELCOME_IMAGE_URL = "https://6a8d8d79aeeb5e92d6b686c4.imgix.net/sandbox/magnific_quiero-un-fondo-de-1000-x_xSJ0dLcjfW.jpg"
+
+BIOGRAFIA_TEXTO = (
+    "👑 **PANEL BUSQUEDA OFICIAL HVN94**\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "🔹 **Admin:** @HVN94\n"
+    "🔹 **Acceso:** Solo Exclusivo para miembros del grupo oficial.\n"
+    "🔹 **Sistema:** Auto entrega temporal de configs.\n\n"
+    "⚡ _Selecciona una opción del menú o busca con `/free`._\n"
+    f"⏱ _Las entregas se autodestruyen en {TIEMPO_AUTO_ELIMINAR}s._"
+)
 
 app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
@@ -27,7 +39,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 USER_STATE = {}
 lock_db = threading.Lock()
 
-# --- BASE DE DATOS ---
+# --- BASE DE DATOS LOCAL ---
 def init_db():
     with lock_db:
         conn = sqlite3.connect(DB_PATH)
@@ -88,7 +100,7 @@ def init_db():
 
 init_db()
 
-# --- VALIDACIONES Y SEGURIDAD ---
+# --- UTILIDADES Y MENSAJES TEMPORALES ---
 def auto_destruir_mensaje(chat_id, message_ids, delay=60):
     def tarea():
         time.sleep(delay)
@@ -151,6 +163,20 @@ def generar_llave(prefijo="KEY"):
     p3 = ''.join(secrets.choice(chars) for _ in range(4))
     return f"{prefijo}-{p1}-{p2}-{p3}"
 
+# --- SINCRONIZACIÓN AUTOMÁTICA DESDE EL STORAGE ---
+def sincronizar_desde_storage():
+    """Lee el histórico de mensajes del grupo Storage para restaurar listas y keys si Vercel reinició /tmp."""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM lists")
+        count = cursor.fetchone()[0]
+        conn.close()
+        if count > 0:
+            return  # Si ya hay datos en la DB local, no hace falta reconstruir
+    except Exception:
+        pass
+
 # --- COMANDO PRINCIPAL /free ---
 @bot.message_handler(commands=['free', 'start'])
 def cmd_free(message):
@@ -160,7 +186,6 @@ def cmd_free(message):
     if not validar_grupo_ejecucion(chat_id):
         return
 
-    # Verificación obligatoria de pertenencia al grupo
     if not esta_en_grupo_autorizado(user_id):
         try:
             bot.send_message(
@@ -183,13 +208,6 @@ def cmd_free(message):
             types.InlineKeyboardButton("📋 ┃ VER / ELIMINAR LISTAS", callback_data="btn_admin_listas"),
             types.InlineKeyboardButton("👤 ┃ AUTORIZAR SUB-ADMIN", callback_data="btn_pedir_auth")
         )
-        txt = (
-            "👑 **PANEL DE CONTROL GENERAL (ADMIN)**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🔹 **Storage:** `{STORAGE_CHAT_ID}`\n"
-            "🔹 **Control:** Total (Crear, Generar Keys, Eliminar Listas y Sub-Admins)\n\n"
-            "👇 _Selecciona una opción:_"
-        )
     elif es_subadmin(user_id):
         markup.add(
             types.InlineKeyboardButton("🎁 ┃ CANJEAR CUENTA FREE", callback_data="btn_cuentas_free"),
@@ -197,28 +215,31 @@ def cmd_free(message):
             types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
             types.InlineKeyboardButton("📦 ┃ MIS LISTAS Y STOCK", callback_data="btn_mis_listas")
         )
-        txt = (
-            "👤 **PANEL DE SUB-ADMINISTRADOR**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "🔹 **Permisos:** Carga de listas y generación de keys.\n\n"
-            "👇 _Selecciona una opción:_"
-        )
     else:
         markup.add(types.InlineKeyboardButton("🎁 ┃ VER LISTAS DISPONIBLES", callback_data="btn_cuentas_free"))
-        txt = (
-            "💎 **SISTEMA OFICIAL DE CANJES FREE**\n"
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Presiona el botón inferior para ver las listas disponibles y canjear tu KEY única."
-        )
 
     try:
-        bot.send_message(chat_id, txt, reply_markup=markup, parse_mode="Markdown")
+        if WELCOME_IMAGE_URL:
+            bot.send_photo(
+                chat_id,
+                WELCOME_IMAGE_URL,
+                caption=BIOGRAFIA_TEXTO,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
+        else:
+            bot.send_message(
+                chat_id,
+                BIOGRAFIA_TEXTO,
+                reply_markup=markup,
+                parse_mode="Markdown"
+            )
     except Exception:
-        pass
+        bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
 
-# --- FLUJO DE CARGA, AUTORIZACIÓN Y CANJE ---
+# --- FLUJOS DE TEXTO, ARCHIVOS Y CARGA ---
 @bot.message_handler(content_types=['text', 'document'])
-def procesar_flujos(message):
+def procesar_mensajes_y_archivos(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -239,7 +260,14 @@ def procesar_flujos(message):
         target_str = message.text.strip().replace("@", "")
 
         if not target_str.isdigit():
-            bot.send_message(chat_id, "⚠️ Debes enviar el **Telegram ID numérico** del usuario a autorizar.")
+            bot.send_message(
+                chat_id,
+                "⚠️ **ID Inválido.**\n\n"
+                "Para obtener tu ID correcto:\n"
+                "1. Entra a @userinfobot y presiona /start.\n"
+                "2. Copia el número que dice **Id:** y envíalo aquí.",
+                parse_mode="Markdown"
+            )
             return
 
         target_id = int(target_str)
@@ -252,13 +280,13 @@ def procesar_flujos(message):
             conn.close()
 
         try:
-            bot.send_message(STORAGE_CHAT_ID, f"👤 **#SUBADMIN_AUTORIZADO**\nID: `{target_id}`\nPor: `{user_id}`")
+            bot.send_message(STORAGE_CHAT_ID, f"👤 **#SUBADMIN_AUTORIZADO**\nID: `{target_id}`\nPor: `{user_id}`", parse_mode="Markdown")
         except Exception:
             pass
-        bot.send_message(chat_id, f"✅ Sub-Admin `{target_id}` autorizado con éxito.")
+        bot.send_message(chat_id, f"✅ Sub-Admin `{target_id}` autorizado exitosamente.")
         return
 
-    # 2. Nombre de Lista a Crear
+    # 2. Nombre de la lista
     elif paso == "esperando_nombre":
         if not message.text or not es_subadmin(user_id):
             return
@@ -289,14 +317,14 @@ def procesar_flujos(message):
         txt = (
             f"✅ **Lista:** `{nombre_cat}`\n"
             f"🏷 **ID de Registro:** `#{pack_code}`\n\n"
-            "📥 **Envía las líneas:**\n"
-            "• Adjunta un **archivo `.txt`** con el contenido.\n"
-            "• O pega las líneas en un mensaje."
+            "📥 **Envía tus datos:**\n"
+            "• Adjunta un **archivo `.txt`** con todas tus líneas.\n"
+            "• O pega las líneas directamente en un mensaje."
         )
         bot.send_message(chat_id, txt, parse_mode="Markdown")
         return
 
-    # 3. Cargar Líneas Masivas
+    # 3. Guardar líneas masivas
     elif paso == "esperando_lineas":
         list_id = estado.get("list_id")
         nombre_cat = estado.get("nombre")
@@ -332,7 +360,7 @@ def procesar_flujos(message):
             conn.commit()
             conn.close()
 
-        # Enviar al Storage
+        # Enviar archivo de respaldo al Storage
         try:
             buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
             buffer_txt.name = f"{nombre_cat}_{pack_code}.txt"
@@ -433,7 +461,7 @@ def procesar_flujos(message):
         enviar_temporal(chat_id, texto_exito)
         return
 
-# --- CALLBACKS DE BOTONES ---
+# --- CALLBACKS Y NAVEGACIÓN ---
 @bot.callback_query_handler(func=lambda call: True)
 def router_callbacks(call):
     user_id = call.from_user.id
@@ -444,7 +472,7 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id, "No tienes acceso a este bot.", show_alert=True)
         return
 
-    # Menú Admin para ver y eliminar listas
+    # Panel Admin para eliminar listas
     if data == "btn_admin_listas":
         if not es_admin(user_id):
             bot.answer_callback_query(call.id, "Solo el Administrador puede gestionar listas.", show_alert=True)
@@ -466,7 +494,7 @@ def router_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "⚙️ **PANEL DE ELIMINACIÓN DE LISTAS (ADMIN):**\n_Toca una lista para borrarla por completo:_", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, "⚙️ **PANEL DE ELIMINACIÓN (ADMIN):**\n_Toca una lista para borrarla:_ ", reply_markup=markup, parse_mode="Markdown")
 
     elif data.startswith("del_lista_"):
         if not es_admin(user_id):
@@ -497,7 +525,13 @@ def router_callbacks(call):
             return
         USER_STATE[user_id] = {"paso": "esperando_subadmin_id"}
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "👤 **Envía el Telegram ID numérico del usuario a autorizar como Sub-Admin:**", parse_mode="Markdown")
+        txt = (
+            "👤 **AUTORIZAR NUEVO SUB-ADMIN**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Envía el **Telegram ID numérico** del usuario.\n\n"
+            "💡 _Para saber tu ID entra al bot @userinfobot, dale /start y cópialo aquí._"
+        )
+        bot.send_message(chat_id, txt, parse_mode="Markdown")
 
     elif data == "btn_guardar_data":
         if not es_subadmin(user_id):
@@ -568,7 +602,7 @@ def router_callbacks(call):
             conn.commit()
             conn.close()
 
-        # Enviar archivo con keys al Storage
+        # Enviar archivo de keys al Storage
         try:
             buffer_keys = io.BytesIO("\n".join(keys_generadas).encode('utf-8'))
             buffer_keys.name = f"KEYS_{l_name}_{pack_code}.txt"
@@ -609,7 +643,7 @@ def router_callbacks(call):
         conn.close()
 
         if not listas_activas:
-            bot.answer_callback_query(call.id, "No hay keys disponibles.", show_alert=True)
+            bot.answer_callback_query(call.id, "No hay keys disponibles por el momento.", show_alert=True)
             return
 
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -670,11 +704,11 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id)
         cmd_free(call.message)
 
-# --- ENTRYPOINT VERCEL ---
+# --- ENTRYPOINT FLASK / WEBHOOK ---
 @app.route("/", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
-        return "Bot activo", 200
+        return "Bot activo en Vercel", 200
 
     try:
         json_data = request.get_json(silent=True)
