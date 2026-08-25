@@ -1,2 +1,10 @@
+[project]
+name = "grupofreebot"
+version = "0.1.0"
+dependencies = [
+    "flask",
+    "pytelegrambotapi"
+]
+
 [tool.vercel]
 entrypoint = "index:app"
