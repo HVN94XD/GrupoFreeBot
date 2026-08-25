@@ -25,12 +25,11 @@ DB_PATH = "/tmp/archivos_bot.db"
 WELCOME_IMAGE_URL = "https://6a8d8d79aeeb5e92d6b686c4.imgix.net/sandbox/magnific_quiero-un-fondo-de-1000-x_xSJ0dLcjfW.jpg"
 
 BIOGRAFIA_TEXTO = (
-    "👑 **PANEL DE ACCESO OFICIAL HVN94**\n"
+    "👑 **PANEL DE CANJES OFICIAL HVN94**\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🔹 **Admin:** @HVN94\n"
-    "🔹 **Acceso:** Exclusivo para miembros de la comunidad.\n"
     "🔹 **Sistema:** Entrega y canje automatizado 1 a 1.\n\n"
-    "⚡ _Selecciona una opción del menú interactivo:_"
+    "⚡ _Selecciona una categoría para canjear tu key:_"
 )
 
 app = Flask(__name__)
@@ -135,30 +134,20 @@ def es_subadmin(user_id):
     conn.close()
     return bool(res)
 
-def esta_en_grupo_autorizado(user_id):
-    if es_admin(user_id):
-        return True
-    try:
-        member = bot.get_chat_member(STORAGE_CHAT_ID, user_id)
-        if member.status in ['creator', 'administrator', 'member', 'restricted']:
-            return True
-    except Exception:
-        pass
-    return False
-
-def validar_grupo_ejecucion(chat_id):
-    # Chat privado o el propio grupo Storage
+def validar_seguridad_chat(chat_id):
+    # 1. Chat Privado directo con el Bot o Grupo Storage
     if chat_id > 0 or chat_id == STORAGE_CHAT_ID:
         return True
     
-    # En cualquier otro grupo, verifica si el ADMIN principal es creador o admin
+    # 2. Grupo público/comunidad: Comprobar si el ADMIN principal está en el grupo
     try:
         admin_member = bot.get_chat_member(chat_id, ADMIN_ID)
-        if admin_member.status in ['creator', 'administrator']:
+        if admin_member.status in ['creator', 'administrator', 'member']:
             return True
     except Exception:
         pass
 
+    # 3. Si el bot fue metido a un grupo sin el Admin presente -> Spamea y se va
     try:
         bot.send_message(chat_id, "🐀 rata rata soy creado por @HVN94")
         bot.leave_chat(chat_id)
@@ -235,8 +224,7 @@ def restaurar_pack_reenviado(message):
         f"♻️ **Lote Restaurado con Éxito**\n━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🏷 **Pack ID:** `#{pack_code}`\n"
         f"📁 **Lista:** `{nombre_cat}`\n"
-        f"📄 **Líneas detectadas:** `{len(lineas)}`\n\n"
-        f"Ya puedes generar tus keys o seguir administrando.",
+        f"📄 **Líneas detectadas:** `{len(lineas)}`",
         reply_markup=markup,
         parse_mode="Markdown"
     )
@@ -247,19 +235,7 @@ def cmd_free(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    if not validar_grupo_ejecucion(chat_id):
-        return
-
-    if not esta_en_grupo_autorizado(user_id):
-        try:
-            bot.send_message(
-                chat_id,
-                "⛔ **ACCESO DENEGADO** ⛔\n━━━━━━━━━━━━━━━━━━━━\n"
-                "Para interactuar con el bot debes pertenecer al grupo oficial.",
-                parse_mode="Markdown"
-            )
-        except Exception:
-            pass
+    if not validar_seguridad_chat(chat_id):
         return
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -280,6 +256,7 @@ def cmd_free(message):
             types.InlineKeyboardButton("📦 ┃ MIS LISTAS Y STOCK", callback_data="btn_mis_listas")
         )
     else:
+        # Menú simple y directo para el usuario regular
         markup.add(types.InlineKeyboardButton("🎁 ┃ VER LISTAS DISPONIBLES", callback_data="btn_cuentas_free"))
 
     try:
@@ -296,13 +273,13 @@ def cmd_free(message):
     except Exception:
         bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
 
-# --- FLUJOS DE TEXTO, ARCHIVOS Y CARGA ---
+# --- FLUJOS DE TEXTO, ARCHIVOS Y CANJES ---
 @bot.message_handler(content_types=['text', 'document'])
 def procesar_mensajes_y_archivos(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    if not validar_grupo_ejecucion(chat_id) or not esta_en_grupo_autorizado(user_id):
+    if not validar_seguridad_chat(chat_id):
         return
 
     if user_id not in USER_STATE:
@@ -378,7 +355,7 @@ def procesar_mensajes_y_archivos(message):
             f"🏷 **ID de Registro:** `#{pack_code}`\n\n"
             "📥 **Envía tus datos:**\n"
             "• Adjunta un **archivo `.txt`** con todas tus líneas.\n"
-            "• O pega las líneas en un mensaje."
+            "• O pega las líneas directamente en un mensaje."
         )
         bot.send_message(chat_id, txt, parse_mode="Markdown")
         return
@@ -419,7 +396,7 @@ def procesar_mensajes_y_archivos(message):
             conn.commit()
             conn.close()
 
-        # Enviar archivo de respaldo al Storage
+        # Enviar archivo de respaldo al Storage privado
         try:
             buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
             buffer_txt.name = f"{nombre_cat}_{pack_code}.txt"
@@ -470,6 +447,7 @@ def procesar_mensajes_y_archivos(message):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
+            # 1 key por usuario por categoría
             cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
             if cursor.fetchone():
                 conn.close()
@@ -496,6 +474,7 @@ def procesar_mensajes_y_archivos(message):
             conn.commit()
             conn.close()
 
+        # Notificar al Storage privado
         try:
             bot.send_message(
                 STORAGE_CHAT_ID,
@@ -519,14 +498,14 @@ def procesar_mensajes_y_archivos(message):
         enviar_temporal(chat_id, texto_exito)
         return
 
-# --- CALLBACKS Y NAVEGACIÓN ---
+# --- CALLBACKS Y ACCIONES DE MENÚ ---
 @bot.callback_query_handler(func=lambda call: True)
 def router_callbacks(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     data = call.data
 
-    if not validar_grupo_ejecucion(chat_id) or not esta_en_grupo_autorizado(user_id):
+    if not validar_seguridad_chat(chat_id):
         bot.answer_callback_query(call.id, "No tienes acceso a este bot.", show_alert=True)
         return
 
@@ -660,7 +639,7 @@ def router_callbacks(call):
             conn.commit()
             conn.close()
 
-        # Enviar archivo de keys al Storage
+        # Enviar archivo de keys al Storage privado
         try:
             buffer_keys = io.BytesIO("\n".join(keys_generadas).encode('utf-8'))
             buffer_keys.name = f"KEYS_{l_name}_{pack_code}.txt"
