@@ -38,6 +38,9 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 USER_STATE = {}
 lock_db = threading.Lock()
 
+# Obtener nombre del bot para enlaces directos
+BOT_USERNAME = "GrupoFreeBot"
+
 # --- BASE DE DATOS ---
 def init_db():
     with lock_db:
@@ -134,6 +137,18 @@ def es_subadmin(user_id):
     conn.close()
     return bool(res)
 
+def esta_en_grupo_autorizado(user_id):
+    if es_admin(user_id):
+        return True
+    # Comprobar pertenencia en el grupo Storage o en el grupo oficial del Admin
+    try:
+        member = bot.get_chat_member(STORAGE_CHAT_ID, user_id)
+        if member.status in ['creator', 'administrator', 'member', 'restricted']:
+            return True
+    except Exception:
+        pass
+    return False
+
 def validar_seguridad_chat(chat_id):
     if chat_id > 0 or chat_id == STORAGE_CHAT_ID:
         return True
@@ -172,13 +187,25 @@ def cmd_reset_claims(message):
         conn.close()
     bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado con éxito.")
 
-# --- COMANDO PRINCIPAL /free ---
+# --- COMANDO PRINCIPAL /free y /start ---
 @bot.message_handler(commands=['free', 'start'])
 def cmd_free(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
+    partes = message.text.split()
 
     if not validar_seguridad_chat(chat_id):
+        return
+
+    # Si entra por enlace privado para canjear (ej: /start canjear_1_IZZI_GO)
+    if chat_id > 0 and len(partes) > 1 and partes[1].startswith("canjear_"):
+        if not esta_en_grupo_autorizado(user_id):
+            bot.send_message(chat_id, "⛔ Para reclamar debes pertenecer al grupo oficial del Administrador.")
+            return
+
+        _, l_id, categoria = partes[1].split("_", 2)
+        USER_STATE[user_id] = {"paso": "esperando_key", "list_id": int(l_id), "categoria": categoria}
+        bot.send_message(chat_id, f"🔐 **Pega tu KEY para `{categoria}`:**\n*(Límite: 1 canje por usuario)*", parse_mode="Markdown")
         return
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -228,16 +255,13 @@ def procesar_archivos_y_reenvios(message):
     caption = message.caption or ""
     texto_total = f"{doc_name} {caption}"
 
-    # 1. RECICLAJE / RESTAURACIÓN POR REENVÍO O ARCHIVO GUARDADO PREVIAMENTE
     if "PACK_" in texto_total.upper() or "_PACK_" in doc_name:
         if not es_subadmin(user_id):
             return
 
-        # Extraer Pack Code
         pack_match = re.search(r"PACK_[A-Za-z0-9_]+", texto_total, re.IGNORECASE)
         pack_code = pack_match.group(0).upper() if pack_match else f"PACK_RECICLADO_{int(time.time())}"
 
-        # Extraer Nombre de la Lista
         lista_match = re.search(r"Lista:\s*([A-Za-z0-9_]+)", caption, re.IGNORECASE)
         if lista_match:
             nombre_cat = lista_match.group(1).upper()
@@ -263,7 +287,6 @@ def procesar_archivos_y_reenvios(message):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
             
-            # Comprobar si la lista ya existe
             cursor.execute("SELECT id FROM lists WHERE name = ?", (nombre_cat,))
             res_l = cursor.fetchone()
             
@@ -299,7 +322,6 @@ def procesar_archivos_y_reenvios(message):
         )
         return
 
-    # 2. CARGA NORMAL DENTRO DEL FLUJO
     estado = USER_STATE.get(user_id, {})
     if estado.get("paso") == "esperando_lineas":
         list_id = estado.get("list_id")
@@ -509,7 +531,7 @@ def procesar_mensajes_texto(message):
         )
         return
 
-    # Canjear Key
+    # Canjear Key en Privado
     elif paso == "esperando_key":
         list_id = estado.get("list_id")
         categoria = estado.get("categoria")
@@ -566,10 +588,7 @@ def procesar_mensajes_texto(message):
             f"{linea_entregada}"
         )
         
-        if chat_id > 0:
-            bot.send_message(chat_id, texto_entrega)
-        else:
-            enviar_temporal(chat_id, texto_entrega + f"\n\n⏱ Este mensaje se auto-eliminará en {TIEMPO_AUTO_ELIMINAR}s.")
+        bot.send_message(chat_id, texto_entrega)
         return
 
 # --- CALLBACKS Y BOTONES ---
@@ -737,6 +756,7 @@ def router_callbacks(call):
             txt_k = "\n".join(keys_generadas)
             bot.send_message(chat_id, f"🔑 {len(keys_generadas)} Keys de {l_name}:\n\n{txt_k}")
 
+    # Menú de Listas Públicas / Canje
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -756,11 +776,20 @@ def router_callbacks(call):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
         for l_id, l_name, stock in listas_activas:
-            markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Stock: {stock})", callback_data=f"pedir_key_{l_id}_{l_name}"))
+            # Si se interactúa desde un grupo, el botón redirige al privado automáticamente
+            if chat_id < 0:
+                enlace_privado = f"https://t.me/{BOT_USERNAME}?start=canjear_{l_id}_{l_name}"
+                markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Stock: {stock}) 🔒", url=enlace_privado))
+            else:
+                markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Stock: {stock})", callback_data=f"pedir_key_{l_id}_{l_name}"))
+
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "📌 Elige la categoría a canjear:", reply_markup=markup)
+        if chat_id < 0:
+            enviar_temporal(chat_id, "📌 Elige una categoría (el canje se completará de forma privada):", markup=markup)
+        else:
+            bot.send_message(chat_id, "📌 Elige la categoría a canjear:", reply_markup=markup)
 
     elif data.startswith("pedir_key_"):
         _, _, l_id, categoria = data.split("_", 3)
