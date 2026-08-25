@@ -99,7 +99,7 @@ def init_db():
 
 init_db()
 
-# --- VALIDACIONES Y UTILIDADES ---
+# --- VALIDACIONES Y SEGURIDAD ---
 def auto_destruir_mensaje(chat_id, message_ids, delay=40):
     def tarea():
         time.sleep(delay)
@@ -160,6 +160,29 @@ def generar_llave(prefijo="KEY"):
     return f"{prefijo}-{p1}-{p2}-{p3}"
 
 # --- COMANDOS ADMIN ---
+@bot.message_handler(commands=['desautorizar'])
+def cmd_desautorizar(message):
+    if not es_admin(message.from_user.id):
+        return
+    partes = message.text.split()
+    if len(partes) < 2 or not partes[1].isdigit():
+        bot.send_message(message.chat.id, "⚠️ Usa: `/desautorizar TELEGRAM_ID`", parse_mode="Markdown")
+        return
+
+    target_id = int(partes[1])
+    with lock_db:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM authorized_users WHERE telegram_id = ?", (target_id,))
+        conn.commit()
+        conn.close()
+
+    try:
+        bot.send_message(STORAGE_CHAT_ID, f"🚫 #SUBADMIN_REVOCADO\nID: {target_id}\nPor: {message.from_user.id}")
+    except Exception:
+        pass
+    bot.send_message(message.chat.id, f"🚫 Permisos de Sub-Admin revocados para `{target_id}`.", parse_mode="Markdown")
+
 @bot.message_handler(commands=['reset_claims'])
 def cmd_reset_claims(message):
     if not es_admin(message.from_user.id):
@@ -170,9 +193,9 @@ def cmd_reset_claims(message):
         cursor.execute("DELETE FROM claims")
         conn.commit()
         conn.close()
-    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado.")
+    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado con éxito.")
 
-# --- COMANDO PRINCIPAL /free ---
+# --- COMANDO PRINCIPAL /free y /start ---
 @bot.message_handler(commands=['free', 'start'])
 def cmd_free(message):
     chat_id = message.chat.id
@@ -189,7 +212,8 @@ def cmd_free(message):
             types.InlineKeyboardButton("➕ ┃ CREAR / AGREGAR LÍNEAS", callback_data="btn_guardar_data"),
             types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
             types.InlineKeyboardButton("📋 ┃ VER / ELIMINAR LISTAS", callback_data="btn_admin_listas"),
-            types.InlineKeyboardButton("👤 ┃ AUTORIZAR SUB-ADMIN", callback_data="btn_pedir_auth")
+            types.InlineKeyboardButton("👤 ┃ AUTORIZAR SUB-ADMIN", callback_data="btn_pedir_auth"),
+            types.InlineKeyboardButton("👥 ┃ GESTIONAR / QUITAR SUB-ADMIN", callback_data="btn_gestionar_subadmins")
         )
     elif es_subadmin(user_id):
         markup.add(
@@ -369,10 +393,9 @@ def procesar_mensajes_texto(message):
     if not validar_seguridad_chat(chat_id):
         return
 
-    # Si un usuario pega directamente una Key en el chat o privado
     texto_ingresado = message.text.strip().upper()
     
-    # Comprobar si el texto ingresado tiene formato de Key
+    # Canje directo si pega una key
     if "-" in texto_ingresado and len(texto_ingresado) >= 12 and user_id not in USER_STATE:
         with lock_db:
             conn = sqlite3.connect(DB_PATH)
@@ -389,14 +412,12 @@ def procesar_mensajes_texto(message):
             if res_key:
                 k_id, list_id, l_name, line_num, line_txt, p_code, claimed = res_key
 
-                # Borrar el mensaje de la key en el grupo para no exponerla
                 if chat_id < 0:
                     try:
                         bot.delete_message(chat_id, message.message_id)
                     except Exception:
                         pass
 
-                # Validar reclamo previo
                 cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
                 if cursor.fetchone():
                     conn.close()
@@ -408,13 +429,11 @@ def procesar_mensajes_texto(message):
                     enviar_temporal(chat_id, "❌ Esta Key ya fue utilizada.")
                     return
 
-                # Canjear
                 cursor.execute("UPDATE keys SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, k_id))
                 cursor.execute("INSERT INTO claims (user_id, list_id, key_id) VALUES (?, ?, ?)", (user_id, list_id, k_id))
                 conn.commit()
                 conn.close()
 
-                # Notificar al Storage
                 try:
                     bot.send_message(
                         STORAGE_CHAT_ID,
@@ -427,13 +446,12 @@ def procesar_mensajes_texto(message):
                 except Exception:
                     pass
 
-                # Si está en privado, entrega normal. Si está en grupo, envía por privado directamente
                 try:
                     bot.send_message(user_id, f"🎉 CANJE EXITOSO - {l_name}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato:\n\n{line_txt}")
                     if chat_id < 0:
                         enviar_temporal(chat_id, f"✅ @{message.from_user.username or 'Usuario'}, te enviamos tu dato por **Mensaje Privado** 📩")
                 except Exception:
-                    enviar_temporal(chat_id, f"⚠️ @{message.from_user.username or 'Usuario'}, inicia el bot por privado (@GrupoFreeBot) para poder enviarte tu cuenta.")
+                    enviar_temporal(chat_id, f"⚠️ Inicia el bot por privado (@GrupoFreeBot) para poder enviarte tu cuenta.")
                 return
             conn.close()
 
@@ -622,7 +640,7 @@ def procesar_mensajes_texto(message):
             enviar_temporal(chat_id, f"⚠️ Inicia el chat con @GrupoFreeBot por privado para recibir tu entrega.")
         return
 
-# --- CALLBACKS Y BOTONES ---
+# --- CALLBACKS Y GESTIÓN DE ROLES ---
 @bot.callback_query_handler(func=lambda call: True)
 def router_callbacks(call):
     user_id = call.from_user.id
@@ -633,7 +651,53 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id, "No tienes acceso a este bot.", show_alert=True)
         return
 
-    if data == "btn_admin_listas":
+    # 1. Panel para listar y eliminar Sub-Admins
+    if data == "btn_gestionar_subadmins":
+        if not es_admin(user_id):
+            bot.answer_callback_query(call.id, "Solo el Administrador puede gestionar Sub-Admins.", show_alert=True)
+            return
+
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT telegram_id, username FROM authorized_users")
+        subs = cursor.fetchall()
+        conn.close()
+
+        if not subs:
+            bot.answer_callback_query(call.id, "No hay Sub-Admins registrados actualmente.", show_alert=True)
+            return
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        for s_id, s_name in subs:
+            markup.add(types.InlineKeyboardButton(f"🚫 Quitar: {s_name} ({s_id})", callback_data=f"del_sub_{s_id}"))
+        markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
+
+        bot.answer_callback_query(call.id)
+        bot.send_message(chat_id, "👥 **GESTIÓN DE SUB-ADMINS:**\n_Toca a un usuario para revocarle el acceso de inmediato:_", reply_markup=markup, parse_mode="Markdown")
+
+    # 2. Quitar un Sub-Admin específico
+    elif data.startswith("del_sub_"):
+        if not es_admin(user_id):
+            bot.answer_callback_query(call.id, "No autorizado.", show_alert=True)
+            return
+
+        target_id = int(data.replace("del_sub_", ""))
+        with lock_db:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM authorized_users WHERE telegram_id = ?", (target_id,))
+            conn.commit()
+            conn.close()
+
+        try:
+            bot.send_message(STORAGE_CHAT_ID, f"🚫 #SUBADMIN_REVOCADO\nID: {target_id}\nPor: {user_id}")
+        except Exception:
+            pass
+
+        bot.answer_callback_query(call.id, f"Sub-Admin {target_id} eliminado.", show_alert=True)
+        bot.send_message(chat_id, f"🚫 **Permisos revocados para el usuario `{target_id}`.**", parse_mode="Markdown")
+
+    elif data == "btn_admin_listas":
         if not es_admin(user_id):
             bot.answer_callback_query(call.id, "Solo el Administrador puede gestionar listas.", show_alert=True)
             return
@@ -787,7 +851,6 @@ def router_callbacks(call):
             txt_k = "\n".join(keys_generadas)
             bot.send_message(chat_id, f"🔑 {len(keys_generadas)} Keys de {l_name}:\n\n{txt_k}")
 
-    # Menú de Canje
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
