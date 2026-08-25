@@ -159,7 +159,7 @@ def generar_llave(prefijo="KEY"):
     p3 = ''.join(secrets.choice(chars) for _ in range(4))
     return f"{prefijo}-{p1}-{p2}-{p3}"
 
-# --- COMANDO DE RESET PARA PRUEBAS (ADMIN) ---
+# --- COMANDOS ADMIN ---
 @bot.message_handler(commands=['reset_claims'])
 def cmd_reset_claims(message):
     if not es_admin(message.from_user.id):
@@ -170,7 +170,7 @@ def cmd_reset_claims(message):
         cursor.execute("DELETE FROM claims")
         conn.commit()
         conn.close()
-    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado. Los usuarios pueden volver a canjear en cualquier lista.")
+    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado con éxito.")
 
 # --- COMANDO PRINCIPAL /free ---
 @bot.message_handler(commands=['free', 'start'])
@@ -215,9 +215,159 @@ def cmd_free(message):
     except Exception:
         bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
 
-# --- FLUJOS DE TEXTO, ARCHIVOS Y CANJES ---
-@bot.message_handler(content_types=['text', 'document'])
-def procesar_mensajes_y_archivos(message):
+# --- PROCESAMIENTO DE ARCHIVOS Y RECICLAJE/REENVÍOS ---
+@bot.message_handler(content_types=['document'])
+def procesar_archivos_y_reenvios(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if not validar_seguridad_chat(chat_id):
+        return
+
+    doc_name = message.document.file_name or ""
+    caption = message.caption or ""
+    texto_total = f"{doc_name} {caption}"
+
+    # 1. RECICLAJE / RESTAURACIÓN POR REENVÍO O ARCHIVO GUARDADO PREVIAMENTE
+    if "PACK_" in texto_total.upper() or "_PACK_" in doc_name:
+        if not es_subadmin(user_id):
+            return
+
+        # Extraer Pack Code
+        pack_match = re.search(r"PACK_[A-Za-z0-9_]+", texto_total, re.IGNORECASE)
+        pack_code = pack_match.group(0).upper() if pack_match else f"PACK_RECICLADO_{int(time.time())}"
+
+        # Extraer Nombre de la Lista
+        lista_match = re.search(r"Lista:\s*([A-Za-z0-9_]+)", caption, re.IGNORECASE)
+        if lista_match:
+            nombre_cat = lista_match.group(1).upper()
+        elif "_PACK_" in doc_name:
+            nombre_cat = doc_name.split("_PACK_")[0].upper()
+        else:
+            nombre_cat = "LISTA"
+
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            contenido = downloaded_file.decode("utf-8", errors="ignore")
+            lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
+        except Exception:
+            bot.send_message(chat_id, "❌ Error al descargar el archivo .txt.")
+            return
+
+        if not lineas:
+            bot.send_message(chat_id, "⚠️ El archivo reenviado no contiene líneas válidas.")
+            return
+
+        with lock_db:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            
+            # Comprobar si la lista ya existe
+            cursor.execute("SELECT id FROM lists WHERE name = ?", (nombre_cat,))
+            res_l = cursor.fetchone()
+            
+            if res_l:
+                list_id = res_l[0]
+                cursor.execute("UPDATE lists SET pack_code = ? WHERE id = ?", (pack_code, list_id))
+            else:
+                cursor.execute("INSERT INTO lists (name, owner_id, pack_code) VALUES (?, ?, ?)", (nombre_cat, user_id, pack_code))
+                list_id = cursor.lastrowid
+
+            cursor.execute("SELECT COUNT(*) FROM lines WHERE list_id = ?", (list_id,))
+            contador_base = cursor.fetchone()[0]
+
+            for idx, l in enumerate(lineas, start=contador_base + 1):
+                cursor.execute("INSERT INTO lines (list_id, line_number, line_text) VALUES (?, ?, ?)", (list_id, idx, l))
+            
+            conn.commit()
+            conn.close()
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(f"🔑 GENERAR KEYS DE {nombre_cat}", callback_data=f"ejecutar_gen_{list_id}"),
+            types.InlineKeyboardButton("🔙 VOLVER AL MENÚ", callback_data="btn_volver_inicio")
+        )
+
+        bot.send_message(
+            chat_id,
+            f"♻️ Lote Restaurado con Éxito\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷 Pack ID: #{pack_code}\n"
+            f"📁 Lista: {nombre_cat}\n"
+            f"📄 Líneas detectadas: {len(lineas)}",
+            reply_markup=markup
+        )
+        return
+
+    # 2. CARGA NORMAL DENTRO DEL FLUJO
+    estado = USER_STATE.get(user_id, {})
+    if estado.get("paso") == "esperando_lineas":
+        list_id = estado.get("list_id")
+        nombre_cat = estado.get("nombre")
+        pack_code = estado.get("pack_code")
+        del USER_STATE[user_id]
+
+        try:
+            file_info = bot.get_file(message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            contenido = downloaded_file.decode("utf-8", errors="ignore")
+            lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
+        except Exception:
+            bot.send_message(chat_id, "❌ Error al leer el archivo adjunto.")
+            return
+
+        if not lineas:
+            bot.send_message(chat_id, "⚠️ El archivo está vacío.")
+            return
+
+        with lock_db:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM lines WHERE list_id = ?", (list_id,))
+            contador_base = cursor.fetchone()[0]
+
+            for idx, l in enumerate(lineas, start=contador_base + 1):
+                cursor.execute("INSERT INTO lines (list_id, line_number, line_text) VALUES (?, ?, ?)", (list_id, idx, l))
+            conn.commit()
+            conn.close()
+
+        try:
+            buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
+            buffer_txt.name = f"{nombre_cat}_{pack_code}.txt"
+            bot.send_document(
+                STORAGE_CHAT_ID,
+                buffer_txt,
+                caption=(
+                    f"📦 #NUEVO_LOTE_REGISTRADO\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🏷 Registro: #{pack_code}\n"
+                    f"📁 Lista: {nombre_cat}\n"
+                    f"👤 Owner: {user_id}\n"
+                    f"🔢 Líneas: {len(lineas)}\n"
+                    f"📅 Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+            )
+        except Exception:
+            pass
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(f"🔑 GENERAR KEYS DE {nombre_cat}", callback_data=f"ejecutar_gen_{list_id}"),
+            types.InlineKeyboardButton("🔙 VOLVER AL MENÚ", callback_data="btn_volver_inicio")
+        )
+
+        bot.send_message(
+            chat_id,
+            f"✅ Lote Guardado en el Storage\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷 Pack ID: #{pack_code}\n"
+            f"📁 Lista: {nombre_cat}\n"
+            f"📄 Líneas cargadas: {len(lineas)}",
+            reply_markup=markup
+        )
+
+# --- FLUJOS DE TEXTO ---
+@bot.message_handler(content_types=['text'])
+def procesar_mensajes_texto(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -230,9 +380,9 @@ def procesar_mensajes_y_archivos(message):
     estado = USER_STATE.get(user_id, {})
     paso = estado.get("paso")
 
-    # 1. Autorizar Sub-Admin por ID
+    # Autorizar Sub-Admin
     if paso == "esperando_subadmin_id":
-        if not es_admin(user_id) or not message.text:
+        if not es_admin(user_id):
             return
         del USER_STATE[user_id]
         target_str = message.text.strip().replace("@", "")
@@ -241,8 +391,8 @@ def procesar_mensajes_y_archivos(message):
             bot.send_message(
                 chat_id,
                 "⚠️ ID Inválido.\n\n"
-                "Para obtener tu ID numérico correcto:\n"
-                "1. Entra a @userinfobot y presiona /start.\n"
+                "Para obtener tu ID numérico:\n"
+                "1. Entra a @userinfobot y dale /start.\n"
                 "2. Copia el número de Id: y envíalo aquí."
             )
             return
@@ -263,9 +413,9 @@ def procesar_mensajes_y_archivos(message):
         bot.send_message(chat_id, f"✅ Sub-Admin {target_id} autorizado exitosamente.")
         return
 
-    # 2. Nombre de la lista
+    # Nombre de lista nueva
     elif paso == "esperando_nombre":
-        if not message.text or not es_subadmin(user_id):
+        if not es_subadmin(user_id):
             return
         nombre_cat = message.text.strip().upper().replace(" ", "_")
         pack_code = f"PACK_{nombre_cat}_{int(time.time())}"
@@ -301,27 +451,14 @@ def procesar_mensajes_y_archivos(message):
         bot.send_message(chat_id, txt)
         return
 
-    # 3. Guardar líneas masivas
+    # Guardar líneas por texto directo
     elif paso == "esperando_lineas":
         list_id = estado.get("list_id")
         nombre_cat = estado.get("nombre")
         pack_code = estado.get("pack_code")
-        lineas = []
-
-        if message.document:
-            try:
-                file_info = bot.get_file(message.document.file_id)
-                downloaded_file = bot.download_file(file_info.file_path)
-                contenido = downloaded_file.decode("utf-8", errors="ignore")
-                lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
-            except Exception:
-                bot.send_message(chat_id, "❌ Error al leer el archivo .txt.")
-                return
-        elif message.text:
-            lineas = [l.strip() for l in message.text.splitlines() if l.strip()]
-
         del USER_STATE[user_id]
 
+        lineas = [l.strip() for l in message.text.splitlines() if l.strip()]
         if not lineas:
             bot.send_message(chat_id, "⚠️ No se detectaron líneas válidas.")
             return
@@ -372,10 +509,8 @@ def procesar_mensajes_y_archivos(message):
         )
         return
 
-    # 4. Canjear Key
+    # Canjear Key
     elif paso == "esperando_key":
-        if not message.text:
-            return
         list_id = estado.get("list_id")
         categoria = estado.get("categoria")
         key_ingresada = message.text.strip().upper()
@@ -385,7 +520,6 @@ def procesar_mensajes_y_archivos(message):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
-            # Comprobar 1 reclamo por usuario por lista
             cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
             if cursor.fetchone():
                 conn.close()
@@ -432,14 +566,13 @@ def procesar_mensajes_y_archivos(message):
             f"{linea_entregada}"
         )
         
-        # En chat privado no se autodestruye para que el usuario conserve su cuenta
         if chat_id > 0:
             bot.send_message(chat_id, texto_entrega)
         else:
             enviar_temporal(chat_id, texto_entrega + f"\n\n⏱ Este mensaje se auto-eliminará en {TIEMPO_AUTO_ELIMINAR}s.")
         return
 
-# --- CALLBACKS Y ACCIONES DE MENÚ ---
+# --- CALLBACKS Y BOTONES ---
 @bot.callback_query_handler(func=lambda call: True)
 def router_callbacks(call):
     user_id = call.from_user.id
