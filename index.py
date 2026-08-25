@@ -110,9 +110,9 @@ def auto_destruir_mensaje(chat_id, message_ids, delay=60):
                 pass
     threading.Thread(target=tarea, daemon=True).start()
 
-def enviar_temporal(chat_id, texto, markup=None, parse_mode="Markdown"):
+def enviar_temporal(chat_id, texto, markup=None):
     try:
-        kwargs = {"parse_mode": parse_mode}
+        kwargs = {}
         if markup:
             kwargs["reply_markup"] = markup
         msg = bot.send_message(chat_id, texto, **kwargs)
@@ -135,11 +135,9 @@ def es_subadmin(user_id):
     return bool(res)
 
 def validar_seguridad_chat(chat_id):
-    # 1. Chat Privado directo con el Bot o Grupo Storage
     if chat_id > 0 or chat_id == STORAGE_CHAT_ID:
         return True
     
-    # 2. Grupo público/comunidad: Comprobar si el ADMIN principal está en el grupo
     try:
         admin_member = bot.get_chat_member(chat_id, ADMIN_ID)
         if admin_member.status in ['creator', 'administrator', 'member']:
@@ -147,7 +145,6 @@ def validar_seguridad_chat(chat_id):
     except Exception:
         pass
 
-    # 3. Si el bot fue metido a un grupo sin el Admin presente -> Spamea y se va
     try:
         bot.send_message(chat_id, "🐀 rata rata soy creado por @HVN94")
         bot.leave_chat(chat_id)
@@ -162,72 +159,18 @@ def generar_llave(prefijo="KEY"):
     p3 = ''.join(secrets.choice(chars) for _ in range(4))
     return f"{prefijo}-{p1}-{p2}-{p3}"
 
-# --- RECONSTRUCTOR DE LOTES REENVIADOS ---
-@bot.message_handler(content_types=['document'], func=lambda m: bool(m.caption and "#NUEVO" in m.caption and "#PACK_" in m.caption))
-def restaurar_pack_reenviado(message):
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if not es_subadmin(user_id):
+# --- COMANDO DE RESET PARA PRUEBAS (ADMIN) ---
+@bot.message_handler(commands=['reset_claims'])
+def cmd_reset_claims(message):
+    if not es_admin(message.from_user.id):
         return
-
-    caption = message.caption
-    pack_match = re.search(r"#PACK_([A-Za-z0-9_]+)", caption)
-    lista_match = re.search(r"Lista:\s*([A-Za-z0-9_]+)", caption, re.IGNORECASE)
-
-    if not pack_match or not lista_match:
-        bot.send_message(chat_id, "⚠️ No se pudo extraer la información del lote reenviado.")
-        return
-
-    pack_code = f"PACK_{pack_match.group(1)}"
-    nombre_cat = lista_match.group(1).upper()
-
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        contenido = downloaded_file.decode("utf-8", errors="ignore")
-        lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
-    except Exception:
-        bot.send_message(chat_id, "❌ Error al descargar el archivo adjunto.")
-        return
-
     with lock_db:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM lists WHERE name = ?", (nombre_cat,))
-        res_l = cursor.fetchone()
-        
-        if res_l:
-            list_id = res_l[0]
-            cursor.execute("UPDATE lists SET pack_code = ? WHERE id = ?", (pack_code, list_id))
-        else:
-            cursor.execute("INSERT INTO lists (name, owner_id, pack_code) VALUES (?, ?, ?)", (nombre_cat, user_id, pack_code))
-            list_id = cursor.lastrowid
-
-        cursor.execute("SELECT COUNT(*) FROM lines WHERE list_id = ?", (list_id,))
-        contador_base = cursor.fetchone()[0]
-
-        for idx, l in enumerate(lineas, start=contador_base + 1):
-            cursor.execute("INSERT INTO lines (list_id, line_number, line_text) VALUES (?, ?, ?)", (list_id, idx, l))
-        
+        cursor.execute("DELETE FROM claims")
         conn.commit()
         conn.close()
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton(f"🔑 GENERAR KEYS DE {nombre_cat}", callback_data=f"ejecutar_gen_{list_id}"),
-        types.InlineKeyboardButton("🔙 VOLVER AL MENÚ", callback_data="btn_volver_inicio")
-    )
-
-    bot.send_message(
-        chat_id,
-        f"♻️ **Lote Restaurado con Éxito**\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏷 **Pack ID:** `#{pack_code}`\n"
-        f"📁 **Lista:** `{nombre_cat}`\n"
-        f"📄 **Líneas detectadas:** `{len(lineas)}`",
-        reply_markup=markup,
-        parse_mode="Markdown"
-    )
+    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado. Los usuarios pueden volver a canjear en cualquier lista.")
 
 # --- COMANDO PRINCIPAL /free ---
 @bot.message_handler(commands=['free', 'start'])
@@ -256,7 +199,6 @@ def cmd_free(message):
             types.InlineKeyboardButton("📦 ┃ MIS LISTAS Y STOCK", callback_data="btn_mis_listas")
         )
     else:
-        # Menú simple y directo para el usuario regular
         markup.add(types.InlineKeyboardButton("🎁 ┃ VER LISTAS DISPONIBLES", callback_data="btn_cuentas_free"))
 
     try:
@@ -298,11 +240,10 @@ def procesar_mensajes_y_archivos(message):
         if not target_str.isdigit():
             bot.send_message(
                 chat_id,
-                "⚠️ **ID Inválido.**\n\n"
+                "⚠️ ID Inválido.\n\n"
                 "Para obtener tu ID numérico correcto:\n"
                 "1. Entra a @userinfobot y presiona /start.\n"
-                "2. Copia el número de **Id:** y envíalo aquí.",
-                parse_mode="Markdown"
+                "2. Copia el número de Id: y envíalo aquí."
             )
             return
 
@@ -316,10 +257,10 @@ def procesar_mensajes_y_archivos(message):
             conn.close()
 
         try:
-            bot.send_message(STORAGE_CHAT_ID, f"👤 **#SUBADMIN_AUTORIZADO**\nID: `{target_id}`\nPor: `{user_id}`", parse_mode="Markdown")
+            bot.send_message(STORAGE_CHAT_ID, f"👤 #SUBADMIN_AUTORIZADO\nID: {target_id}\nPor: {user_id}")
         except Exception:
             pass
-        bot.send_message(chat_id, f"✅ Sub-Admin `{target_id}` autorizado exitosamente.")
+        bot.send_message(chat_id, f"✅ Sub-Admin {target_id} autorizado exitosamente.")
         return
 
     # 2. Nombre de la lista
@@ -339,7 +280,7 @@ def procesar_mensajes_y_archivos(message):
                 if not es_admin(user_id) and existente[1] != user_id:
                     conn.close()
                     del USER_STATE[user_id]
-                    bot.send_message(chat_id, f"⛔ La lista `{nombre_cat}` fue creada por otro usuario.")
+                    bot.send_message(chat_id, f"⛔ La lista {nombre_cat} fue creada por otro usuario.")
                     return
                 list_id = existente[0]
                 pack_code = existente[2]
@@ -351,13 +292,13 @@ def procesar_mensajes_y_archivos(message):
 
         USER_STATE[user_id] = {"paso": "esperando_lineas", "list_id": list_id, "nombre": nombre_cat, "pack_code": pack_code}
         txt = (
-            f"✅ **Lista:** `{nombre_cat}`\n"
-            f"🏷 **ID de Registro:** `#{pack_code}`\n\n"
-            "📥 **Envía tus datos:**\n"
-            "• Adjunta un **archivo `.txt`** con todas tus líneas.\n"
+            f"✅ Lista: {nombre_cat}\n"
+            f"🏷 ID de Registro: #{pack_code}\n\n"
+            "📥 Envía tus datos:\n"
+            "• Adjunta un archivo .txt con todas tus líneas.\n"
             "• O pega las líneas directamente en un mensaje."
         )
-        bot.send_message(chat_id, txt, parse_mode="Markdown")
+        bot.send_message(chat_id, txt)
         return
 
     # 3. Guardar líneas masivas
@@ -374,7 +315,7 @@ def procesar_mensajes_y_archivos(message):
                 contenido = downloaded_file.decode("utf-8", errors="ignore")
                 lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
             except Exception:
-                bot.send_message(chat_id, "❌ Error al leer el archivo `.txt`.")
+                bot.send_message(chat_id, "❌ Error al leer el archivo .txt.")
                 return
         elif message.text:
             lineas = [l.strip() for l in message.text.splitlines() if l.strip()]
@@ -396,7 +337,6 @@ def procesar_mensajes_y_archivos(message):
             conn.commit()
             conn.close()
 
-        # Enviar archivo de respaldo al Storage privado
         try:
             buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
             buffer_txt.name = f"{nombre_cat}_{pack_code}.txt"
@@ -404,15 +344,14 @@ def procesar_mensajes_y_archivos(message):
                 STORAGE_CHAT_ID,
                 buffer_txt,
                 caption=(
-                    f"📦 **#NUEVO_LOTE_REGISTRADO**\n"
+                    f"📦 #NUEVO_LOTE_REGISTRADO\n"
                     f"━━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🏷 **Registro:** `#{pack_code}`\n"
-                    f"📁 **Lista:** `{nombre_cat}`\n"
-                    f"👤 **Owner:** `{user_id}`\n"
-                    f"🔢 **Líneas:** `{len(lineas)}`\n"
-                    f"📅 **Fecha:** `{time.strftime('%Y-%m-%d %H:%M:%S')}`"
-                ),
-                parse_mode="Markdown"
+                    f"🏷 Registro: #{pack_code}\n"
+                    f"📁 Lista: {nombre_cat}\n"
+                    f"👤 Owner: {user_id}\n"
+                    f"🔢 Líneas: {len(lineas)}\n"
+                    f"📅 Fecha: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
             )
         except Exception:
             pass
@@ -425,12 +364,11 @@ def procesar_mensajes_y_archivos(message):
 
         bot.send_message(
             chat_id,
-            f"✅ **Lote Guardado en el Storage**\n━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷 **Pack ID:** `#{pack_code}`\n"
-            f"📁 **Lista:** `{nombre_cat}`\n"
-            f"📄 **Líneas cargadas:** `{len(lineas)}`",
-            reply_markup=markup,
-            parse_mode="Markdown"
+            f"✅ Lote Guardado en el Storage\n━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🏷 Pack ID: #{pack_code}\n"
+            f"📁 Lista: {nombre_cat}\n"
+            f"📄 Líneas cargadas: {len(lineas)}",
+            reply_markup=markup
         )
         return
 
@@ -447,11 +385,11 @@ def procesar_mensajes_y_archivos(message):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
-            # 1 key por usuario por categoría
+            # Comprobar 1 reclamo por usuario por lista
             cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
             if cursor.fetchone():
                 conn.close()
-                bot.send_message(chat_id, f"❌ Ya reclamaste una key en la categoría **{categoria}**.")
+                bot.send_message(chat_id, f"❌ Ya reclamaste una key en la categoría {categoria}.")
                 return
 
             cursor.execute("""
@@ -465,7 +403,7 @@ def procesar_mensajes_y_archivos(message):
 
             if not key_data:
                 conn.close()
-                bot.send_message(chat_id, f"❌ Key inválida, ya utilizada o no pertenece a `{categoria}`.")
+                bot.send_message(chat_id, f"❌ Key inválida, ya utilizada o no pertenece a {categoria}.")
                 return
 
             k_id, line_num, linea_entregada, pack_code = key_data
@@ -474,28 +412,31 @@ def procesar_mensajes_y_archivos(message):
             conn.commit()
             conn.close()
 
-        # Notificar al Storage privado
+        # Notificar al Storage
         try:
             bot.send_message(
                 STORAGE_CHAT_ID,
-                f"🎟 **#CANJE_REGISTRADO**\n"
-                f"🏷 **Pack:** `#{pack_code}`\n"
-                f"🔑 **Key:** `{key_ingresada}`\n"
-                f"📍 **Línea:** `#{line_num}`\n"
-                f"👤 **Usuario:** @{message.from_user.username or 'Anon'} (`{user_id}`)",
-                parse_mode="Markdown"
+                f"🎟 #CANJE_REGISTRADO\n"
+                f"🏷 Pack: #{pack_code}\n"
+                f"🔑 Key: {key_ingresada}\n"
+                f"📍 Línea: #{line_num}\n"
+                f"👤 Usuario: @{message.from_user.username or 'Anon'} ({user_id})"
             )
         except Exception:
             pass
 
-        texto_exito = (
-            f"🎉 **CANJE EXITOSO - {categoria}**\n"
+        texto_entrega = (
+            f"🎉 CANJE EXITOSO - {categoria}\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 **Tu dato entregado (Línea #{line_num}):**\n\n"
-            f"`{linea_entregada}`\n\n"
-            f"⏱ _Este mensaje se auto-eliminará en {TIEMPO_AUTO_ELIMINAR}s._"
+            f"📋 Tu dato entregado (Línea #{line_num}):\n\n"
+            f"{linea_entregada}"
         )
-        enviar_temporal(chat_id, texto_exito)
+        
+        # En chat privado no se autodestruye para que el usuario conserve su cuenta
+        if chat_id > 0:
+            bot.send_message(chat_id, texto_entrega)
+        else:
+            enviar_temporal(chat_id, texto_entrega + f"\n\n⏱ Este mensaje se auto-eliminará en {TIEMPO_AUTO_ELIMINAR}s.")
         return
 
 # --- CALLBACKS Y ACCIONES DE MENÚ ---
@@ -509,7 +450,6 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id, "No tienes acceso a este bot.", show_alert=True)
         return
 
-    # Panel Admin para eliminar listas
     if data == "btn_admin_listas":
         if not es_admin(user_id):
             bot.answer_callback_query(call.id, "Solo el Administrador puede gestionar listas.", show_alert=True)
@@ -531,7 +471,7 @@ def router_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "⚙️ **PANEL DE ELIMINACIÓN (ADMIN):**\n_Toca una lista para borrarla:_ ", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, "⚙️ PANEL DE ELIMINACIÓN (ADMIN):\nToca una lista para borrarla:", reply_markup=markup)
 
     elif data.startswith("del_lista_"):
         if not es_admin(user_id):
@@ -554,7 +494,7 @@ def router_callbacks(call):
             conn.close()
 
         bot.answer_callback_query(call.id, f"Lista {nom} eliminada.", show_alert=True)
-        bot.send_message(chat_id, f"🗑️ **Lista `{nom}` eliminada por el Administrador.**", parse_mode="Markdown")
+        bot.send_message(chat_id, f"🗑️ Lista {nom} eliminada por el Administrador.")
 
     elif data == "btn_pedir_auth":
         if not es_admin(user_id):
@@ -563,12 +503,12 @@ def router_callbacks(call):
         USER_STATE[user_id] = {"paso": "esperando_subadmin_id"}
         bot.answer_callback_query(call.id)
         txt = (
-            "👤 **AUTORIZAR NUEVO SUB-ADMIN**\n"
+            "👤 AUTORIZAR NUEVO SUB-ADMIN\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            "Envía el **Telegram ID numérico** del usuario.\n\n"
-            "💡 _Para saber tu ID entra al bot @userinfobot, dale /start y cópialo aquí._"
+            "Envía el Telegram ID numérico del usuario.\n\n"
+            "💡 Para saber tu ID entra al bot @userinfobot, dale /start y cópialo aquí."
         )
-        bot.send_message(chat_id, txt, parse_mode="Markdown")
+        bot.send_message(chat_id, txt)
 
     elif data == "btn_guardar_data":
         if not es_subadmin(user_id):
@@ -576,7 +516,7 @@ def router_callbacks(call):
             return
         USER_STATE[user_id] = {"paso": "esperando_nombre"}
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "📝 **Ingresa el NOMBRE de la lista/categoría (ej: HVN o HVN2):**", parse_mode="Markdown")
+        bot.send_message(chat_id, "📝 Ingresa el NOMBRE de la lista/categoría (ej: HVN o HVN2):")
 
     elif data == "btn_elegir_gen_keys":
         if not es_subadmin(user_id):
@@ -602,7 +542,7 @@ def router_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "⚙️ **Elige la lista para generar keys:**", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, "⚙️ Elige la lista para generar keys:", reply_markup=markup)
 
     elif data.startswith("ejecutar_gen_"):
         l_id = int(data.replace("ejecutar_gen_", ""))
@@ -639,15 +579,13 @@ def router_callbacks(call):
             conn.commit()
             conn.close()
 
-        # Enviar archivo de keys al Storage privado
         try:
             buffer_keys = io.BytesIO("\n".join(keys_generadas).encode('utf-8'))
             buffer_keys.name = f"KEYS_{l_name}_{pack_code}.txt"
             bot.send_document(
                 STORAGE_CHAT_ID,
                 buffer_keys,
-                caption=f"🔑 **#KEYS_GENERADAS**\n🏷 **Pack:** `#{pack_code}`\n📁 **Lista:** `{l_name}`\n🔢 **Total:** `{len(keys_generadas)}`",
-                parse_mode="Markdown"
+                caption=f"🔑 #KEYS_GENERADAS\n🏷 Pack: #{pack_code}\n📁 Lista: {l_name}\n🔢 Total: {len(keys_generadas)}"
             )
         except Exception:
             pass
@@ -660,11 +598,11 @@ def router_callbacks(call):
             bot.send_document(
                 chat_id,
                 buffer_user,
-                caption=f"🔑 **{len(keys_generadas)} Keys Generadas para `{l_name}`**"
+                caption=f"🔑 {len(keys_generadas)} Keys Generadas para {l_name}"
             )
         else:
             txt_k = "\n".join(keys_generadas)
-            bot.send_message(chat_id, f"🔑 **{len(keys_generadas)} Keys de `{l_name}`:**\n\n`{txt_k}`", parse_mode="Markdown")
+            bot.send_message(chat_id, f"🔑 {len(keys_generadas)} Keys de {l_name}:\n\n{txt_k}")
 
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
@@ -689,13 +627,13 @@ def router_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "📌 **Elige la categoría a canjear:**", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, "📌 Elige la categoría a canjear:", reply_markup=markup)
 
     elif data.startswith("pedir_key_"):
         _, _, l_id, categoria = data.split("_", 3)
         USER_STATE[user_id] = {"paso": "esperando_key", "list_id": int(l_id), "categoria": categoria}
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, f"🔐 **Pega tu KEY para `{categoria}`:**\n*(Límite: 1 canje por usuario)*", parse_mode="Markdown")
+        bot.send_message(chat_id, f"🔐 Pega tu KEY para {categoria}:\n(Límite: 1 canje por usuario)")
 
     elif data == "btn_mis_listas":
         if not es_subadmin(user_id):
@@ -727,15 +665,15 @@ def router_callbacks(call):
             bot.answer_callback_query(call.id, "No tienes listas creadas.", show_alert=True)
             return
 
-        txt = "📦 **LISTAS Y REGISTROS EN STORAGE:**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        txt = "📦 LISTAS Y REGISTROS EN STORAGE:\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         for name, p_code, total_l, stock_k in listas:
-            txt += f"🔹 **{name}** (`#{p_code}`)\n   ├ 📄 Líneas: `{total_l}`\n   └ 🔑 Keys libres: `{stock_k}`\n\n"
+            txt += f"🔹 {name} (#{p_code})\n   ├ 📄 Líneas: {total_l}\n   └ 🔑 Keys libres: {stock_k}\n\n"
 
         markup = types.InlineKeyboardMarkup(row_width=1)
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, txt, reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, txt, reply_markup=markup)
 
     elif data == "btn_volver_inicio":
         bot.answer_callback_query(call.id)
