@@ -13,7 +13,7 @@ from telebot import types
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 
-raw_storage_id = os.environ.get("STORAGE_CHAT_ID", "-1005372728688").strip()
+raw_storage_id = os.environ.get("STORAGE_CHAT_ID", "-1004360797820").strip()
 if raw_storage_id.startswith("-") and not raw_storage_id.startswith("-100"):
     raw_storage_id = "-100" + raw_storage_id[1:]
 STORAGE_CHAT_ID = int(raw_storage_id)
