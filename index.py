@@ -19,7 +19,7 @@ if raw_storage_id.startswith("-") and not raw_storage_id.startswith("-100"):
     raw_storage_id = "-100" + raw_storage_id[1:]
 STORAGE_CHAT_ID = int(raw_storage_id)
 
-TIEMPO_AUTO_ELIMINAR = 60
+TIEMPO_AUTO_ELIMINAR = 40
 DB_PATH = "/tmp/archivos_bot.db"
 
 WELCOME_IMAGE_URL = "https://6a8d8d79aeeb5e92d6b686c4.imgix.net/sandbox/magnific_quiero-un-fondo-de-1000-x_xSJ0dLcjfW.jpg"
@@ -37,9 +37,6 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 USER_STATE = {}
 lock_db = threading.Lock()
-
-# Obtener nombre del bot para enlaces directos
-BOT_USERNAME = "GrupoFreeBot"
 
 # --- BASE DE DATOS ---
 def init_db():
@@ -102,8 +99,8 @@ def init_db():
 
 init_db()
 
-# --- VALIDACIONES Y SEGURIDAD ---
-def auto_destruir_mensaje(chat_id, message_ids, delay=60):
+# --- VALIDACIONES Y UTILIDADES ---
+def auto_destruir_mensaje(chat_id, message_ids, delay=40):
     def tarea():
         time.sleep(delay)
         for msg_id in message_ids:
@@ -136,18 +133,6 @@ def es_subadmin(user_id):
     res = cursor.fetchone()
     conn.close()
     return bool(res)
-
-def esta_en_grupo_autorizado(user_id):
-    if es_admin(user_id):
-        return True
-    # Comprobar pertenencia en el grupo Storage o en el grupo oficial del Admin
-    try:
-        member = bot.get_chat_member(STORAGE_CHAT_ID, user_id)
-        if member.status in ['creator', 'administrator', 'member', 'restricted']:
-            return True
-    except Exception:
-        pass
-    return False
 
 def validar_seguridad_chat(chat_id):
     if chat_id > 0 or chat_id == STORAGE_CHAT_ID:
@@ -185,27 +170,15 @@ def cmd_reset_claims(message):
         cursor.execute("DELETE FROM claims")
         conn.commit()
         conn.close()
-    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado con éxito.")
+    bot.send_message(message.chat.id, "🔄 Historial de reclamos reseteado.")
 
-# --- COMANDO PRINCIPAL /free y /start ---
+# --- COMANDO PRINCIPAL /free ---
 @bot.message_handler(commands=['free', 'start'])
 def cmd_free(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
-    partes = message.text.split()
 
     if not validar_seguridad_chat(chat_id):
-        return
-
-    # Si entra por enlace privado para canjear (ej: /start canjear_1_IZZI_GO)
-    if chat_id > 0 and len(partes) > 1 and partes[1].startswith("canjear_"):
-        if not esta_en_grupo_autorizado(user_id):
-            bot.send_message(chat_id, "⛔ Para reclamar debes pertenecer al grupo oficial del Administrador.")
-            return
-
-        _, l_id, categoria = partes[1].split("_", 2)
-        USER_STATE[user_id] = {"paso": "esperando_key", "list_id": int(l_id), "categoria": categoria}
-        bot.send_message(chat_id, f"🔐 **Pega tu KEY para `{categoria}`:**\n*(Límite: 1 canje por usuario)*", parse_mode="Markdown")
         return
 
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -396,6 +369,74 @@ def procesar_mensajes_texto(message):
     if not validar_seguridad_chat(chat_id):
         return
 
+    # Si un usuario pega directamente una Key en el chat o privado
+    texto_ingresado = message.text.strip().upper()
+    
+    # Comprobar si el texto ingresado tiene formato de Key
+    if "-" in texto_ingresado and len(texto_ingresado) >= 12 and user_id not in USER_STATE:
+        with lock_db:
+            conn = sqlite3.connect(DB_PATH)
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT k.id, k.list_id, l.name, li.line_number, li.line_text, l.pack_code, k.claimed
+                FROM keys k
+                JOIN lists l ON k.list_id = l.id
+                JOIN lines li ON k.line_id = li.id
+                WHERE k.key_value = ?
+            """, (texto_ingresado,))
+            res_key = cursor.fetchone()
+
+            if res_key:
+                k_id, list_id, l_name, line_num, line_txt, p_code, claimed = res_key
+
+                # Borrar el mensaje de la key en el grupo para no exponerla
+                if chat_id < 0:
+                    try:
+                        bot.delete_message(chat_id, message.message_id)
+                    except Exception:
+                        pass
+
+                # Validar reclamo previo
+                cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
+                if cursor.fetchone():
+                    conn.close()
+                    enviar_temporal(chat_id, f"❌ @{message.from_user.username or 'Usuario'}, ya reclamaste en la categoría {l_name}.")
+                    return
+
+                if claimed == 1:
+                    conn.close()
+                    enviar_temporal(chat_id, "❌ Esta Key ya fue utilizada.")
+                    return
+
+                # Canjear
+                cursor.execute("UPDATE keys SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, k_id))
+                cursor.execute("INSERT INTO claims (user_id, list_id, key_id) VALUES (?, ?, ?)", (user_id, list_id, k_id))
+                conn.commit()
+                conn.close()
+
+                # Notificar al Storage
+                try:
+                    bot.send_message(
+                        STORAGE_CHAT_ID,
+                        f"🎟 #CANJE_REGISTRADO\n"
+                        f"🏷 Pack: #{p_code}\n"
+                        f"🔑 Key: {texto_ingresado}\n"
+                        f"📍 Línea: #{line_num}\n"
+                        f"👤 Usuario: @{message.from_user.username or 'Anon'} ({user_id})"
+                    )
+                except Exception:
+                    pass
+
+                # Si está en privado, entrega normal. Si está en grupo, envía por privado directamente
+                try:
+                    bot.send_message(user_id, f"🎉 CANJE EXITOSO - {l_name}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato:\n\n{line_txt}")
+                    if chat_id < 0:
+                        enviar_temporal(chat_id, f"✅ @{message.from_user.username or 'Usuario'}, te enviamos tu dato por **Mensaje Privado** 📩")
+                except Exception:
+                    enviar_temporal(chat_id, f"⚠️ @{message.from_user.username or 'Usuario'}, inicia el bot por privado (@GrupoFreeBot) para poder enviarte tu cuenta.")
+                return
+            conn.close()
+
     if user_id not in USER_STATE:
         return
 
@@ -410,13 +451,7 @@ def procesar_mensajes_texto(message):
         target_str = message.text.strip().replace("@", "")
 
         if not target_str.isdigit():
-            bot.send_message(
-                chat_id,
-                "⚠️ ID Inválido.\n\n"
-                "Para obtener tu ID numérico:\n"
-                "1. Entra a @userinfobot y dale /start.\n"
-                "2. Copia el número de Id: y envíalo aquí."
-            )
+            bot.send_message(chat_id, "⚠️ ID Inválido. Usa @userinfobot para ver tu ID numérico.")
             return
 
         target_id = int(target_str)
@@ -463,17 +498,10 @@ def procesar_mensajes_texto(message):
             conn.close()
 
         USER_STATE[user_id] = {"paso": "esperando_lineas", "list_id": list_id, "nombre": nombre_cat, "pack_code": pack_code}
-        txt = (
-            f"✅ Lista: {nombre_cat}\n"
-            f"🏷 ID de Registro: #{pack_code}\n\n"
-            "📥 Envía tus datos:\n"
-            "• Adjunta un archivo .txt con todas tus líneas.\n"
-            "• O pega las líneas directamente en un mensaje."
-        )
-        bot.send_message(chat_id, txt)
+        bot.send_message(chat_id, f"✅ Lista: {nombre_cat}\n🏷 ID: #{pack_code}\n\nEnvía tu archivo .txt o pega las líneas:")
         return
 
-    # Guardar líneas por texto directo
+    # Guardar líneas por texto
     elif paso == "esperando_lineas":
         list_id = estado.get("list_id")
         nombre_cat = estado.get("nombre")
@@ -531,12 +559,18 @@ def procesar_mensajes_texto(message):
         )
         return
 
-    # Canjear Key en Privado
+    # Canje por estado
     elif paso == "esperando_key":
         list_id = estado.get("list_id")
         categoria = estado.get("categoria")
         key_ingresada = message.text.strip().upper()
         del USER_STATE[user_id]
+
+        if chat_id < 0:
+            try:
+                bot.delete_message(chat_id, message.message_id)
+            except Exception:
+                pass
 
         with lock_db:
             conn = sqlite3.connect(DB_PATH)
@@ -545,7 +579,7 @@ def procesar_mensajes_texto(message):
             cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
             if cursor.fetchone():
                 conn.close()
-                bot.send_message(chat_id, f"❌ Ya reclamaste una key en la categoría {categoria}.")
+                enviar_temporal(chat_id, f"❌ Ya reclamaste una key en la categoría {categoria}.")
                 return
 
             cursor.execute("""
@@ -559,7 +593,7 @@ def procesar_mensajes_texto(message):
 
             if not key_data:
                 conn.close()
-                bot.send_message(chat_id, f"❌ Key inválida, ya utilizada o no pertenece a {categoria}.")
+                enviar_temporal(chat_id, f"❌ Key inválida, ya utilizada o no pertenece a {categoria}.")
                 return
 
             k_id, line_num, linea_entregada, pack_code = key_data
@@ -568,7 +602,6 @@ def procesar_mensajes_texto(message):
             conn.commit()
             conn.close()
 
-        # Notificar al Storage
         try:
             bot.send_message(
                 STORAGE_CHAT_ID,
@@ -581,14 +614,12 @@ def procesar_mensajes_texto(message):
         except Exception:
             pass
 
-        texto_entrega = (
-            f"🎉 CANJE EXITOSO - {categoria}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 Tu dato entregado (Línea #{line_num}):\n\n"
-            f"{linea_entregada}"
-        )
-        
-        bot.send_message(chat_id, texto_entrega)
+        try:
+            bot.send_message(user_id, f"🎉 CANJE EXITOSO - {categoria}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato:\n\n{linea_entregada}")
+            if chat_id < 0:
+                enviar_temporal(chat_id, f"✅ @{message.from_user.username or 'Usuario'}, tu cuenta fue entregada por **Privado** 📩")
+        except Exception:
+            enviar_temporal(chat_id, f"⚠️ Inicia el chat con @GrupoFreeBot por privado para recibir tu entrega.")
         return
 
 # --- CALLBACKS Y BOTONES ---
@@ -756,7 +787,7 @@ def router_callbacks(call):
             txt_k = "\n".join(keys_generadas)
             bot.send_message(chat_id, f"🔑 {len(keys_generadas)} Keys de {l_name}:\n\n{txt_k}")
 
-    # Menú de Listas Públicas / Canje
+    # Menú de Canje
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -776,26 +807,17 @@ def router_callbacks(call):
 
         markup = types.InlineKeyboardMarkup(row_width=1)
         for l_id, l_name, stock in listas_activas:
-            # Si se interactúa desde un grupo, el botón redirige al privado automáticamente
-            if chat_id < 0:
-                enlace_privado = f"https://t.me/{BOT_USERNAME}?start=canjear_{l_id}_{l_name}"
-                markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Stock: {stock}) 🔒", url=enlace_privado))
-            else:
-                markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Stock: {stock})", callback_data=f"pedir_key_{l_id}_{l_name}"))
-
+            markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Stock: {stock})", callback_data=f"pedir_key_{l_id}_{l_name}"))
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        if chat_id < 0:
-            enviar_temporal(chat_id, "📌 Elige una categoría (el canje se completará de forma privada):", markup=markup)
-        else:
-            bot.send_message(chat_id, "📌 Elige la categoría a canjear:", reply_markup=markup)
+        bot.send_message(chat_id, "📌 Elige la categoría a canjear:", reply_markup=markup)
 
     elif data.startswith("pedir_key_"):
         _, _, l_id, categoria = data.split("_", 3)
         USER_STATE[user_id] = {"paso": "esperando_key", "list_id": int(l_id), "categoria": categoria}
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, f"🔐 Pega tu KEY para {categoria}:\n(Límite: 1 canje por usuario)")
+        enviar_temporal(chat_id, f"🔐 @{call.from_user.username or 'Usuario'}, pega tu KEY para {categoria} aquí:\n_(Tu mensaje se borrará al enviarlo por seguridad)_")
 
     elif data == "btn_mis_listas":
         if not es_subadmin(user_id):
