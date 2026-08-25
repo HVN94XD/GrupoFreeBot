@@ -1,3 +1,4 @@
+import io
 import os
 import sqlite3
 import secrets
@@ -13,7 +14,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "0"))
 STORAGE_CHAT_ID = int(os.environ.get("STORAGE_CHAT_ID", "-1005372728688"))
 
-TIEMPO_AUTO_ELIMINAR = 40
+TIEMPO_AUTO_ELIMINAR = 60
 DB_PATH = "/tmp/archivos_bot.db"
 
 app = Flask(__name__)
@@ -82,7 +83,7 @@ def init_db():
 init_db()
 
 # --- UTILIDADES ---
-def auto_destruir_mensaje(chat_id, message_ids, delay=40):
+def auto_destruir_mensaje(chat_id, message_ids, delay=60):
     def tarea():
         time.sleep(delay)
         for msg_id in message_ids:
@@ -98,9 +99,9 @@ def borrar_comando(message):
     except Exception:
         pass
 
-def enviar_temporal(chat_id, texto, markup=None):
+def enviar_temporal(chat_id, texto, markup=None, parse_mode="Markdown"):
     try:
-        kwargs = {}
+        kwargs = {"parse_mode": parse_mode}
         if markup:
             kwargs["reply_markup"] = markup
         msg = bot.send_message(chat_id, texto, **kwargs)
@@ -129,72 +130,53 @@ def generar_llave(prefijo="KEY"):
     p3 = ''.join(secrets.choice(chars) for _ in range(4))
     return f"{prefijo}-{p1}-{p2}-{p3}"
 
-# --- MENÚ PRINCIPAL ---
+# --- MENÚ PRINCIPAL CON BOTONES AMPLIOS ---
 @bot.message_handler(commands=['start', 'menu'])
 def cmd_menu(message):
     borrar_comando(message)
     user_id = message.from_user.id
-    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup = types.InlineKeyboardMarkup(row_width=1)
 
     if usuario_autorizado(user_id):
         markup.add(
-            types.InlineKeyboardButton("➕ Guardar Lista / Líneas", callback_data="btn_guardar_data"),
-            types.InlineKeyboardButton("🔑 Generar Keys", callback_data="btn_elegir_gen_keys"),
-            types.InlineKeyboardButton("📦 Mis Listas", callback_data="btn_mis_listas"),
-            types.InlineKeyboardButton("🎁 Cuenta FREE (Canje)", callback_data="btn_cuentas_free")
+            types.InlineKeyboardButton("🎁 ┃ CANJEAR CUENTA FREE", callback_data="btn_cuentas_free"),
+            types.InlineKeyboardButton("➕ ┃ CREAR / AGREGAR LÍNEAS", callback_data="btn_guardar_data"),
+            types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
+            types.InlineKeyboardButton("📦 ┃ MIS LISTAS Y STOCK", callback_data="btn_mis_listas")
+        )
+        txt = (
+            "👑 **PANEL DE ADMINISTRACIÓN Y CONTROL**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "🔹 **Estado:** Autorizado / Administrador\n"
+            "🔹 **Soporte masivo:** Texto directo o archivos `.txt`\n"
+            "🔹 **Regla:** 1 Key por usuario por categoría\n\n"
+            "👇 _Selecciona una opción del menú:_"
         )
     else:
-        markup.add(types.InlineKeyboardButton("🎁 Cuenta FREE / Canjear", callback_data="btn_cuentas_free"))
+        markup.add(types.InlineKeyboardButton("🎁 ┃ RECLAMAR CUENTA FREE", callback_data="btn_cuentas_free"))
+        txt = (
+            "💎 **PANEL DE RECLAMOS OFICIAL**\n"
+            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Reclama tus cuentas pegando tu KEY única de acceso.\n\n"
+            "👇 _Toca el botón inferior para comenzar:_"
+        )
 
-    enviar_temporal(message.chat.id, "👑 **PANEL DE CONTROL**\nSelecciona una acción:", markup=markup)
+    enviar_temporal(message.chat.id, txt, markup=markup)
 
-@bot.message_handler(commands=['autorizar'])
-def cmd_autorizar(message):
-    borrar_comando(message)
-    if not es_admin(message.from_user.id):
-        return
-
-    partes = message.text.split()
-    target_id = None
-    target_user = "Usuario"
-
-    if message.reply_to_message:
-        target_id = message.reply_to_message.from_user.id
-        target_user = message.reply_to_message.from_user.username or f"ID_{target_id}"
-    elif len(partes) >= 2 and partes[1].replace("@", "").isdigit():
-        target_id = int(partes[1].replace("@", ""))
-        target_user = f"ID_{target_id}"
-    elif len(partes) >= 2:
-        target_user = partes[1].replace("@", "")
-        target_id = hash(target_user) & 0xFFFFFFFF
-
-    if not target_id:
-        enviar_temporal(message.chat.id, "⚠️ Usa: `/autorizar ID_NUMERICO` o responde a un mensaje con `/autorizar`.")
-        return
-
-    with lock_db:
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO authorized_users (telegram_id, username, authorized_by) VALUES (?, ?, ?)",
-                       (target_id, target_user, message.from_user.id))
-        conn.commit()
-        conn.close()
-
-    try:
-        bot.send_message(STORAGE_CHAT_ID, f"#AUTH_USER\nUSER_ID: {target_id}\nUSER: @{target_user}\nBY_ADMIN: {message.from_user.id}")
-    except Exception:
-        pass
-    enviar_temporal(message.chat.id, f"✅ Usuario `@{target_user}` (`{target_id}`) autorizado con éxito.")
-
-# --- PROCESAMIENTO DE MENSAJES Y TEXTO ---
-@bot.message_handler(func=lambda m: m.from_user.id in USER_STATE)
-def procesar_mensajes_usuario(message):
+# --- FLUJO DE GUARDADO (TEXTO Y DOCUMENTOS .TXT) ---
+@bot.message_handler(content_types=['text', 'document'])
+def procesar_mensajes_y_archivos(message):
     user_id = message.from_user.id
+    if user_id not in USER_STATE:
+        return
+
     estado = USER_STATE.get(user_id, {})
     paso = estado.get("paso")
 
-    # Paso 1: Recibir Nombre de la lista
+    # Paso 1: Nombre de la lista
     if paso == "esperando_nombre":
+        if not message.text:
+            return
         nombre_cat = message.text.strip().upper().replace(" ", "_")
         borrar_comando(message)
 
@@ -208,7 +190,7 @@ def procesar_mensajes_usuario(message):
                 if not es_admin(user_id) and existente[1] != user_id:
                     conn.close()
                     del USER_STATE[user_id]
-                    enviar_temporal(message.chat.id, f"⛔ La lista `{nombre_cat}` pertenece a otro usuario.")
+                    enviar_temporal(message.chat.id, f"⛔ La lista `{nombre_cat}` fue creada por otro usuario.")
                     return
                 list_id = existente[0]
             else:
@@ -218,20 +200,40 @@ def procesar_mensajes_usuario(message):
             conn.close()
 
         USER_STATE[user_id] = {"paso": "esperando_lineas", "list_id": list_id, "nombre": nombre_cat}
-        enviar_temporal(message.chat.id, f"✅ Categoría: **{nombre_cat}**\n\nEnvía la lista de líneas (una cuenta por línea):")
+        txt = (
+            f"✅ **Categoría seleccionada:** `{nombre_cat}`\n\n"
+            "📥 **¿Cómo cargar tus datos masivos?**\n"
+            "1. **Opción Recomendada:** Sube un **archivo `.txt`** con 200, 500 o 1,000+ líneas.\n"
+            "2. **Opción Texto:** Pega el texto directamente aquí en el chat."
+        )
+        enviar_temporal(message.chat.id, txt)
         return
 
-    # Paso 2: Guardar las líneas en la lista
+    # Paso 2: Procesar líneas masivas (Texto o Archivo)
     elif paso == "esperando_lineas":
         list_id = estado.get("list_id")
         nombre_cat = estado.get("nombre")
-        raw_text = message.text
-        lineas = [l.strip() for l in raw_text.splitlines() if l.strip()]
+        lineas = []
+
+        # Subida por archivo .txt
+        if message.document:
+            try:
+                file_info = bot.get_file(message.document.file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                contenido = downloaded_file.decode("utf-8", errors="ignore")
+                lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
+            except Exception:
+                enviar_temporal(message.chat.id, "❌ Error al leer el archivo. Sube un `.txt` válido.")
+                return
+        # Subida por texto pegado
+        elif message.text:
+            lineas = [l.strip() for l in message.text.splitlines() if l.strip()]
+
         borrar_comando(message)
         del USER_STATE[user_id]
 
         if not lineas:
-            enviar_temporal(message.chat.id, "⚠️ No enviaste líneas válidas.")
+            enviar_temporal(message.chat.id, "⚠️ No se detectaron líneas válidas para guardar.")
             return
 
         with lock_db:
@@ -242,27 +244,38 @@ def procesar_mensajes_usuario(message):
             conn.commit()
             conn.close()
 
-        # Enviar copia al grupo privado
+        # Enviar copia de respaldo al grupo Storage como archivo .txt para no romper límites
         try:
-            bot.send_message(
+            buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
+            buffer_txt.name = f"{nombre_cat}_lineas_{len(lineas)}.txt"
+            bot.send_document(
                 STORAGE_CHAT_ID,
-                f"#DATA_PACK\nCATEGORIA: {nombre_cat}\nOWNER: {user_id}\nTOTAL: {len(lineas)}\n---\n" + "\n".join(lineas)
+                buffer_txt,
+                caption=f"#CARGA_MASIVA\n📁 LISTA: {nombre_cat}\n👤 OWNER: {user_id}\n🔢 TOTAL LÍNEAS: {len(lineas)}"
             )
         except Exception:
             pass
 
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton(f"🔑 Generar Keys de {nombre_cat}", callback_data=f"ejecutar_gen_{list_id}"))
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton(f"🔑 GENERAR {len(lineas)} KEYS DE {nombre_cat}", callback_data=f"ejecutar_gen_{list_id}"),
+            types.InlineKeyboardButton("🔙 VOLVER AL MENÚ", callback_data="btn_volver_inicio")
+        )
 
         enviar_temporal(
             message.chat.id,
-            f"✅ **Líneas Almacenadas**\n📁 Lista: `{nombre_cat}`\n📄 Agregadas: `{len(lineas)}` líneas.\n\nPresiona abajo para generar las keys:",
+            f"✅ **Líneas Guardadas Correctamente**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📁 **Lista:** `{nombre_cat}`\n"
+            f"📄 **Líneas añadidas:** `{len(lineas)}`\n\n"
+            f"👉 _Toca el botón grande abajo para generar las llaves vinculadas 1x1:_",
             markup=markup
         )
         return
 
-    # Paso 3: Validación y canje de la Key
+    # Paso 3: Canjear Key
     elif paso == "esperando_key":
+        if not message.text:
+            return
         list_id = estado.get("list_id")
         categoria = estado.get("categoria")
         key_ingresada = message.text.strip().upper()
@@ -273,14 +286,13 @@ def procesar_mensajes_usuario(message):
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
 
-            # REGLA: 1 canje por usuario por lista
+            # Comprobar 1 key por usuario por lista
             cursor.execute("SELECT id FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
             if cursor.fetchone():
                 conn.close()
-                enviar_temporal(message.chat.id, f"❌ Ya utilizaste una key de la lista **{categoria}**.\nNo puedes reclamar otra de esta misma lista.")
+                enviar_temporal(message.chat.id, f"❌ **Acceso denegado.** Ya canjeaste una key en `{categoria}`.")
                 return
 
-            # Validar Key disponible
             cursor.execute("""
                 SELECT k.id, l.line_text 
                 FROM keys k 
@@ -291,7 +303,7 @@ def procesar_mensajes_usuario(message):
 
             if not key_data:
                 conn.close()
-                enviar_temporal(message.chat.id, f"❌ Key inválida, ya reclamada o no pertenece a `{categoria}`.")
+                enviar_temporal(message.chat.id, f"❌ Key inválida, agotada o no pertenece a `{categoria}`.")
                 return
 
             k_id, linea_entregada = key_data
@@ -300,44 +312,42 @@ def procesar_mensajes_usuario(message):
             conn.commit()
             conn.close()
 
-        # Registrar reclamo en Storage
         try:
             bot.send_message(
                 STORAGE_CHAT_ID,
-                f"#CANJE_REALIZADO\nUSER_ID: {user_id}\nUSER: @{message.from_user.username or 'Anon'}\nLISTA: {categoria}\nKEY: {key_ingresada}"
+                f"#CANJE\nUSER_ID: {user_id}\nUSER: @{message.from_user.username or 'Anon'}\nLISTA: {categoria}\nKEY: {key_ingresada}"
             )
         except Exception:
             pass
 
         texto_exito = (
-            f"🎉 **CANJE EXITOSO - {categoria}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 **Tu línea entregada es:**\n`{linea_entregada}`\n\n"
-            f"⏱ _Auto-eliminación en {TIEMPO_AUTO_ELIMINAR}s._"
+            f"🎉 **CANJE COMPLETADO - {categoria}**\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 **Tu dato entregado es:**\n\n"
+            f"`{linea_entregada}`\n\n"
+            f"⏱ _Este mensaje se autodestruirá en {TIEMPO_AUTO_ELIMINAR}s._"
         )
         enviar_temporal(message.chat.id, texto_exito)
         return
 
-# --- CALLBACKS Y BOTONES ---
+# --- CALLBACKS Y NAVEGACIÓN ---
 @bot.callback_query_handler(func=lambda call: True)
 def router_botones(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     data = call.data
 
-    # 1. Iniciar guardado de lista
     if data == "btn_guardar_data":
         if not usuario_autorizado(user_id):
-            bot.answer_callback_query(call.id, "No tienes permiso.", show_alert=True)
+            bot.answer_callback_query(call.id, "No tienes permisos.", show_alert=True)
             return
         USER_STATE[user_id] = {"paso": "esperando_nombre"}
         bot.answer_callback_query(call.id)
-        enviar_temporal(chat_id, "📝 Ingresa el NOMBRE de la lista/botón (ej: HVN o HVN2):")
+        enviar_temporal(chat_id, "📝 **Escribe el NOMBRE de la lista/botón (ej: HVN o HVN2):**")
 
-    # 2. Botón para elegir qué lista generar keys
     elif data == "btn_elegir_gen_keys":
         if not usuario_autorizado(user_id):
-            bot.answer_callback_query(call.id, "No tienes permiso.", show_alert=True)
+            bot.answer_callback_query(call.id, "No tienes permisos.", show_alert=True)
             return
 
         conn = sqlite3.connect(DB_PATH)
@@ -353,14 +363,14 @@ def router_botones(call):
             bot.answer_callback_query(call.id, "No tienes listas creadas.", show_alert=True)
             return
 
-        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup = types.InlineKeyboardMarkup(row_width=1)
         for l_id, l_name in listas:
-            markup.add(types.InlineKeyboardButton(f"🔑 {l_name}", callback_data=f"ejecutar_gen_{l_id}"))
+            markup.add(types.InlineKeyboardButton(f"🔑 ┃ Generar Keys para: {l_name}", callback_data=f"ejecutar_gen_{l_id}"))
+        markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        enviar_temporal(chat_id, "📌 **Selecciona la lista a la que deseas generar keys:**", markup=markup)
+        enviar_temporal(chat_id, "⚙️ **Elige la lista a la cual generar keys:**", markup=markup)
 
-    # 3. Generar las llaves 1 a 1 para las líneas pendientes
     elif data.startswith("ejecutar_gen_"):
         l_id = int(data.replace("ejecutar_gen_", ""))
         
@@ -375,7 +385,6 @@ def router_botones(call):
                 return
             l_name = res_n[0]
 
-            # Buscar líneas que aún no tienen key asignada
             cursor.execute("""
                 SELECT l.id FROM lines l 
                 LEFT JOIN keys k ON l.id = k.line_id 
@@ -385,7 +394,7 @@ def router_botones(call):
 
             if not lineas_sin_key:
                 conn.close()
-                bot.answer_callback_query(call.id, f"Todas las líneas de {l_name} ya tienen keys generadas.", show_alert=True)
+                bot.answer_callback_query(call.id, f"Todas las líneas de {l_name} ya tienen keys.", show_alert=True)
                 return
 
             keys_generadas = []
@@ -397,25 +406,22 @@ def router_botones(call):
             conn.commit()
             conn.close()
 
-        # Guardar en Storage
-        try:
-            bot.send_message(
-                STORAGE_CHAT_ID,
-                f"#KEYS_GENERADAS\nLISTA: {l_name}\nTOTAL: {len(keys_generadas)}\n---\n" + "\n".join(keys_generadas)
+        bot.answer_callback_query(call.id, "¡Generación completada!")
+
+        # Enviar archivo .txt con todas las keys si son muchas
+        if len(keys_generadas) > 20:
+            buffer_keys = io.BytesIO("\n".join(keys_generadas).encode('utf-8'))
+            buffer_keys.name = f"KEYS_{l_name}_{len(keys_generadas)}.txt"
+            doc_msg = bot.send_document(
+                chat_id,
+                buffer_keys,
+                caption=f"🔑 **{len(keys_generadas)} Keys Generadas para `{l_name}`**\n_Descarga el archivo con tu lote completo._"
             )
-        except Exception:
-            pass
+            auto_destruir_mensaje(chat_id, [doc_msg.message_id], delay=TIEMPO_AUTO_ELIMINAR)
+        else:
+            txt_k = "\n".join(keys_generadas)
+            enviar_temporal(chat_id, f"🔑 **{len(keys_generadas)} Keys Generadas para `{l_name}`:**\n\n`{txt_k}`")
 
-        bot.answer_callback_query(call.id, "¡Keys generadas!")
-        
-        # Enviar listado al usuario
-        txt_keys = "\n".join(keys_generadas)
-        enviar_temporal(
-            chat_id,
-            f"🔑 **{len(keys_generadas)} Keys Generadas para `{l_name}`:**\n\n`{txt_keys}`"
-        )
-
-    # 4. Menú de Cuentas FREE (Seleccionar lista y canjear)
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -430,24 +436,23 @@ def router_botones(call):
         conn.close()
 
         if not listas_activas:
-            bot.answer_callback_query(call.id, "No hay keys disponibles para canjear en este momento.", show_alert=True)
+            bot.answer_callback_query(call.id, "No hay keys disponibles.", show_alert=True)
             return
 
-        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup = types.InlineKeyboardMarkup(row_width=1)
         for l_id, l_name, stock in listas_activas:
-            markup.add(types.InlineKeyboardButton(f"🔹 {l_name} (Stock: {stock})", callback_data=f"pedir_key_{l_id}_{l_name}"))
+            markup.add(types.InlineKeyboardButton(f"🎁 ┃ {l_name} — (Disponibles: {stock})", callback_data=f"pedir_key_{l_id}_{l_name}"))
+        markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        enviar_temporal(chat_id, "🎁 **Selecciona la lista que deseas canjear:**", markup=markup)
+        enviar_temporal(chat_id, "📌 **Selecciona la categoría que deseas canjear:**", markup=markup)
 
-    # 5. Pedir la Key
     elif data.startswith("pedir_key_"):
         _, _, l_id, categoria = data.split("_", 3)
         USER_STATE[user_id] = {"paso": "esperando_key", "list_id": int(l_id), "categoria": categoria}
         bot.answer_callback_query(call.id)
-        enviar_temporal(chat_id, f"🔑 **Pega tu KEY para `{categoria}`:**\n*(Límite: 1 canje por persona)*")
+        enviar_temporal(chat_id, f"🔐 **Pega tu KEY para `{categoria}`:**\n*(Límite: 1 canje por usuario)*")
 
-    # 6. Ver Mis Listas
     elif data == "btn_mis_listas":
         if not usuario_autorizado(user_id):
             return
@@ -475,17 +480,24 @@ def router_botones(call):
         conn.close()
 
         if not listas:
-            bot.answer_callback_query(call.id, "No hay listas registradas.", show_alert=True)
+            bot.answer_callback_query(call.id, "No tienes listas creadas.", show_alert=True)
             return
 
-        txt = "📦 **Listas Registradas:**\n\n"
+        txt = "📦 **LISTAS REGISTRADAS Y STOCK ACTUAL:**\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         for name, total_l, stock_k in listas:
-            txt += f"• **{name}**: {total_l} líneas cargadas | {stock_k} keys libres\n"
+            txt += f"🔹 **{name}**\n   ├ 📄 Líneas totales: `{total_l}`\n   └ 🔑 Keys libres: `{stock_k}`\n\n"
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        enviar_temporal(chat_id, txt)
+        enviar_temporal(chat_id, txt, markup=markup)
 
-# --- WEBHOOK ENTRYPOINT ---
+    elif data == "btn_volver_inicio":
+        bot.answer_callback_query(call.id)
+        cmd_menu(call.message)
+
+# --- ENTRYPOINT VERCEL ---
 @app.route("/", methods=["GET", "POST"])
 def webhook():
     if request.method == "GET":
