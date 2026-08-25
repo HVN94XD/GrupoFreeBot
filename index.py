@@ -162,6 +162,8 @@ def generar_llave(prefijo="KEY"):
 # --- COMANDOS ADMIN ---
 @bot.message_handler(commands=['desautorizar'])
 def cmd_desautorizar(message):
+    if message.chat.id < 0:
+        return
     if not es_admin(message.from_user.id):
         return
     partes = message.text.split()
@@ -206,24 +208,29 @@ def cmd_free(message):
 
     markup = types.InlineKeyboardMarkup(row_width=1)
 
-    if es_admin(user_id):
-        markup.add(
-            types.InlineKeyboardButton("🎁 ┃ CANJEAR CUENTA FREE", callback_data="btn_cuentas_free"),
-            types.InlineKeyboardButton("➕ ┃ CREAR / AGREGAR LÍNEAS", callback_data="btn_guardar_data"),
-            types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
-            types.InlineKeyboardButton("📋 ┃ VER / ELIMINAR LISTAS", callback_data="btn_admin_listas"),
-            types.InlineKeyboardButton("👤 ┃ AUTORIZAR SUB-ADMIN", callback_data="btn_pedir_auth"),
-            types.InlineKeyboardButton("👥 ┃ GESTIONAR / QUITAR SUB-ADMIN", callback_data="btn_gestionar_subadmins")
-        )
-    elif es_subadmin(user_id):
-        markup.add(
-            types.InlineKeyboardButton("🎁 ┃ CANJEAR CUENTA FREE", callback_data="btn_cuentas_free"),
-            types.InlineKeyboardButton("➕ ┃ CREAR / AGREGAR LÍNEAS", callback_data="btn_guardar_data"),
-            types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
-            types.InlineKeyboardButton("📦 ┃ MIS LISTAS Y STOCK", callback_data="btn_mis_listas")
-        )
-    else:
+    # 1. EN GRUPOS: JAMÁS MOSTRAR PANEL ADMIN, SOLO BOTÓN DE CANJES
+    if chat_id < 0 and chat_id != STORAGE_CHAT_ID:
         markup.add(types.InlineKeyboardButton("🎁 ┃ VER LISTAS DISPONIBLES", callback_data="btn_cuentas_free"))
+    # 2. EN PRIVADO: MOSTRAR SEGÚN ROL
+    else:
+        if es_admin(user_id):
+            markup.add(
+                types.InlineKeyboardButton("🎁 ┃ CANJEAR CUENTA FREE", callback_data="btn_cuentas_free"),
+                types.InlineKeyboardButton("➕ ┃ CREAR / AGREGAR LÍNEAS", callback_data="btn_guardar_data"),
+                types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
+                types.InlineKeyboardButton("📋 ┃ VER / ELIMINAR LISTAS", callback_data="btn_admin_listas"),
+                types.InlineKeyboardButton("👤 ┃ AUTORIZAR SUB-ADMIN", callback_data="btn_pedir_auth"),
+                types.InlineKeyboardButton("👥 ┃ GESTIONAR / QUITAR SUB-ADMIN", callback_data="btn_gestionar_subadmins")
+            )
+        elif es_subadmin(user_id):
+            markup.add(
+                types.InlineKeyboardButton("🎁 ┃ CANJEAR CUENTA FREE", callback_data="btn_cuentas_free"),
+                types.InlineKeyboardButton("➕ ┃ CREAR / AGREGAR LÍNEAS", callback_data="btn_guardar_data"),
+                types.InlineKeyboardButton("🔑 ┃ GENERAR KEYS DE LISTA", callback_data="btn_elegir_gen_keys"),
+                types.InlineKeyboardButton("📦 ┃ MIS LISTAS Y STOCK", callback_data="btn_mis_listas")
+            )
+        else:
+            markup.add(types.InlineKeyboardButton("🎁 ┃ VER LISTAS DISPONIBLES", callback_data="btn_cuentas_free"))
 
     try:
         if WELCOME_IMAGE_URL:
@@ -239,13 +246,17 @@ def cmd_free(message):
     except Exception:
         bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
 
-# --- PROCESAMIENTO DE ARCHIVOS Y RECICLAJE/REENVÍOS ---
+# --- PROCESAMIENTO DE ARCHIVOS (SOLO PRIVADO O STORAGE) ---
 @bot.message_handler(content_types=['document'])
 def procesar_archivos_y_reenvios(message):
     chat_id = message.chat.id
     user_id = message.from_user.id
 
     if not validar_seguridad_chat(chat_id):
+        return
+
+    # Bloquear carga de documentos en grupos públicos
+    if chat_id < 0 and chat_id != STORAGE_CHAT_ID:
         return
 
     doc_name = message.document.file_name or ""
@@ -395,7 +406,7 @@ def procesar_mensajes_texto(message):
 
     texto_ingresado = message.text.strip().upper()
     
-    # Canje directo si pega una key
+    # 1. Canje directo si pega una key
     if "-" in texto_ingresado and len(texto_ingresado) >= 12 and user_id not in USER_STATE:
         with lock_db:
             conn = sqlite3.connect(DB_PATH)
@@ -455,13 +466,17 @@ def procesar_mensajes_texto(message):
                 return
             conn.close()
 
+    # Bloquear flujos de administración si se ejecutan dentro de un grupo
+    if chat_id < 0:
+        return
+
     if user_id not in USER_STATE:
         return
 
     estado = USER_STATE.get(user_id, {})
     paso = estado.get("paso")
 
-    # Autorizar Sub-Admin
+    # Autorizar Sub-Admin (Solo en Privado)
     if paso == "esperando_subadmin_id":
         if not es_admin(user_id):
             return
@@ -488,7 +503,7 @@ def procesar_mensajes_texto(message):
         bot.send_message(chat_id, f"✅ Sub-Admin {target_id} autorizado exitosamente.")
         return
 
-    # Nombre de lista nueva
+    # Nombre de lista nueva (Solo en Privado)
     elif paso == "esperando_nombre":
         if not es_subadmin(user_id):
             return
@@ -519,7 +534,7 @@ def procesar_mensajes_texto(message):
         bot.send_message(chat_id, f"✅ Lista: {nombre_cat}\n🏷 ID: #{pack_code}\n\nEnvía tu archivo .txt o pega las líneas:")
         return
 
-    # Guardar líneas por texto
+    # Guardar líneas por texto (Solo en Privado)
     elif paso == "esperando_lineas":
         list_id = estado.get("list_id")
         nombre_cat = estado.get("nombre")
@@ -584,12 +599,6 @@ def procesar_mensajes_texto(message):
         key_ingresada = message.text.strip().upper()
         del USER_STATE[user_id]
 
-        if chat_id < 0:
-            try:
-                bot.delete_message(chat_id, message.message_id)
-            except Exception:
-                pass
-
         with lock_db:
             conn = sqlite3.connect(DB_PATH)
             cursor = conn.cursor()
@@ -634,10 +643,8 @@ def procesar_mensajes_texto(message):
 
         try:
             bot.send_message(user_id, f"🎉 CANJE EXITOSO - {categoria}\n━━━━━━━━━━━━━━━━━━━━━━\n📋 Tu dato:\n\n{linea_entregada}")
-            if chat_id < 0:
-                enviar_temporal(chat_id, f"✅ @{message.from_user.username or 'Usuario'}, tu cuenta fue entregada por **Privado** 📩")
         except Exception:
-            enviar_temporal(chat_id, f"⚠️ Inicia el chat con @GrupoFreeBot por privado para recibir tu entrega.")
+            pass
         return
 
 # --- CALLBACKS Y GESTIÓN DE ROLES ---
@@ -651,7 +658,11 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id, "No tienes acceso a este bot.", show_alert=True)
         return
 
-    # 1. Panel para listar y eliminar Sub-Admins
+    # Bloquear acciones de administración si el callback viene de un grupo público
+    if chat_id < 0 and data not in ["btn_cuentas_free", "btn_volver_inicio"] and not data.startswith("pedir_key_"):
+        bot.answer_callback_query(call.id, "⚠️ El panel de administración solo funciona en chat privado.", show_alert=True)
+        return
+
     if data == "btn_gestionar_subadmins":
         if not es_admin(user_id):
             bot.answer_callback_query(call.id, "Solo el Administrador puede gestionar Sub-Admins.", show_alert=True)
@@ -664,7 +675,7 @@ def router_callbacks(call):
         conn.close()
 
         if not subs:
-            bot.answer_callback_query(call.id, "No hay Sub-Admins registrados actualmente.", show_alert=True)
+            bot.answer_callback_query(call.id, "No hay Sub-Admins registrados.", show_alert=True)
             return
 
         markup = types.InlineKeyboardMarkup(row_width=1)
@@ -673,9 +684,8 @@ def router_callbacks(call):
         markup.add(types.InlineKeyboardButton("🔙 ┃ Volver al Menú", callback_data="btn_volver_inicio"))
 
         bot.answer_callback_query(call.id)
-        bot.send_message(chat_id, "👥 **GESTIÓN DE SUB-ADMINS:**\n_Toca a un usuario para revocarle el acceso de inmediato:_", reply_markup=markup, parse_mode="Markdown")
+        bot.send_message(chat_id, "👥 **GESTIÓN DE SUB-ADMINS:**\n_Toca a un usuario para revocarle el acceso:_", reply_markup=markup, parse_mode="Markdown")
 
-    # 2. Quitar un Sub-Admin específico
     elif data.startswith("del_sub_"):
         if not es_admin(user_id):
             bot.answer_callback_query(call.id, "No autorizado.", show_alert=True)
@@ -695,7 +705,7 @@ def router_callbacks(call):
             pass
 
         bot.answer_callback_query(call.id, f"Sub-Admin {target_id} eliminado.", show_alert=True)
-        bot.send_message(chat_id, f"🚫 **Permisos revocados para el usuario `{target_id}`.**", parse_mode="Markdown")
+        bot.send_message(chat_id, f"🚫 **Permisos revocados para `{target_id}`.**", parse_mode="Markdown")
 
     elif data == "btn_admin_listas":
         if not es_admin(user_id):
@@ -851,6 +861,7 @@ def router_callbacks(call):
             txt_k = "\n".join(keys_generadas)
             bot.send_message(chat_id, f"🔑 {len(keys_generadas)} Keys de {l_name}:\n\n{txt_k}")
 
+    # Menú de Canje
     elif data == "btn_cuentas_free":
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
