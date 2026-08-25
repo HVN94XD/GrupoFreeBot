@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import sqlite3
 import secrets
 import string
@@ -24,13 +25,12 @@ DB_PATH = "/tmp/archivos_bot.db"
 WELCOME_IMAGE_URL = "https://6a8d8d79aeeb5e92d6b686c4.imgix.net/sandbox/magnific_quiero-un-fondo-de-1000-x_xSJ0dLcjfW.jpg"
 
 BIOGRAFIA_TEXTO = (
-    "👑 **PANEL BUSQUEDA OFICIAL HVN94**\n"
+    "👑 **PANEL DE ACCESO OFICIAL HVN94**\n"
     "━━━━━━━━━━━━━━━━━━━━━━\n"
     "🔹 **Admin:** @HVN94\n"
-    "🔹 **Acceso:** Solo Exclusivo para miembros del grupo oficial.\n"
-    "🔹 **Sistema:** Auto entrega temporal de configs.\n\n"
-    "⚡ _Selecciona una opción del menú o busca con `/free`._\n"
-    f"⏱ _Las entregas se autodestruyen en {TIEMPO_AUTO_ELIMINAR}s._"
+    "🔹 **Acceso:** Exclusivo para miembros de la comunidad.\n"
+    "🔹 **Sistema:** Entrega y canje automatizado 1 a 1.\n\n"
+    "⚡ _Selecciona una opción del menú interactivo:_"
 )
 
 app = Flask(__name__)
@@ -39,7 +39,7 @@ bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 USER_STATE = {}
 lock_db = threading.Lock()
 
-# --- BASE DE DATOS LOCAL ---
+# --- BASE DE DATOS ---
 def init_db():
     with lock_db:
         conn = sqlite3.connect(DB_PATH)
@@ -100,7 +100,7 @@ def init_db():
 
 init_db()
 
-# --- UTILIDADES Y MENSAJES TEMPORALES ---
+# --- VALIDACIONES Y SEGURIDAD ---
 def auto_destruir_mensaje(chat_id, message_ids, delay=60):
     def tarea():
         time.sleep(delay)
@@ -147,8 +147,18 @@ def esta_en_grupo_autorizado(user_id):
     return False
 
 def validar_grupo_ejecucion(chat_id):
-    if chat_id == STORAGE_CHAT_ID or chat_id > 0:
+    # Chat privado o el propio grupo Storage
+    if chat_id > 0 or chat_id == STORAGE_CHAT_ID:
         return True
+    
+    # En cualquier otro grupo, verifica si el ADMIN principal es creador o admin
+    try:
+        admin_member = bot.get_chat_member(chat_id, ADMIN_ID)
+        if admin_member.status in ['creator', 'administrator']:
+            return True
+    except Exception:
+        pass
+
     try:
         bot.send_message(chat_id, "🐀 rata rata soy creado por @HVN94")
         bot.leave_chat(chat_id)
@@ -163,19 +173,73 @@ def generar_llave(prefijo="KEY"):
     p3 = ''.join(secrets.choice(chars) for _ in range(4))
     return f"{prefijo}-{p1}-{p2}-{p3}"
 
-# --- SINCRONIZACIÓN AUTOMÁTICA DESDE EL STORAGE ---
-def sincronizar_desde_storage():
-    """Lee el histórico de mensajes del grupo Storage para restaurar listas y keys si Vercel reinició /tmp."""
+# --- RECONSTRUCTOR DE LOTES REENVIADOS ---
+@bot.message_handler(content_types=['document'], func=lambda m: bool(m.caption and "#NUEVO" in m.caption and "#PACK_" in m.caption))
+def restaurar_pack_reenviado(message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    if not es_subadmin(user_id):
+        return
+
+    caption = message.caption
+    pack_match = re.search(r"#PACK_([A-Za-z0-9_]+)", caption)
+    lista_match = re.search(r"Lista:\s*([A-Za-z0-9_]+)", caption, re.IGNORECASE)
+
+    if not pack_match or not lista_match:
+        bot.send_message(chat_id, "⚠️ No se pudo extraer la información del lote reenviado.")
+        return
+
+    pack_code = f"PACK_{pack_match.group(1)}"
+    nombre_cat = lista_match.group(1).upper()
+
     try:
+        file_info = bot.get_file(message.document.file_id)
+        downloaded_file = bot.download_file(file_info.file_path)
+        contenido = downloaded_file.decode("utf-8", errors="ignore")
+        lineas = [l.strip() for l in contenido.splitlines() if l.strip()]
+    except Exception:
+        bot.send_message(chat_id, "❌ Error al descargar el archivo adjunto.")
+        return
+
+    with lock_db:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM lists")
-        count = cursor.fetchone()[0]
+        cursor.execute("SELECT id FROM lists WHERE name = ?", (nombre_cat,))
+        res_l = cursor.fetchone()
+        
+        if res_l:
+            list_id = res_l[0]
+            cursor.execute("UPDATE lists SET pack_code = ? WHERE id = ?", (pack_code, list_id))
+        else:
+            cursor.execute("INSERT INTO lists (name, owner_id, pack_code) VALUES (?, ?, ?)", (nombre_cat, user_id, pack_code))
+            list_id = cursor.lastrowid
+
+        cursor.execute("SELECT COUNT(*) FROM lines WHERE list_id = ?", (list_id,))
+        contador_base = cursor.fetchone()[0]
+
+        for idx, l in enumerate(lineas, start=contador_base + 1):
+            cursor.execute("INSERT INTO lines (list_id, line_number, line_text) VALUES (?, ?, ?)", (list_id, idx, l))
+        
+        conn.commit()
         conn.close()
-        if count > 0:
-            return  # Si ya hay datos en la DB local, no hace falta reconstruir
-    except Exception:
-        pass
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton(f"🔑 GENERAR KEYS DE {nombre_cat}", callback_data=f"ejecutar_gen_{list_id}"),
+        types.InlineKeyboardButton("🔙 VOLVER AL MENÚ", callback_data="btn_volver_inicio")
+    )
+
+    bot.send_message(
+        chat_id,
+        f"♻️ **Lote Restaurado con Éxito**\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏷 **Pack ID:** `#{pack_code}`\n"
+        f"📁 **Lista:** `{nombre_cat}`\n"
+        f"📄 **Líneas detectadas:** `{len(lineas)}`\n\n"
+        f"Ya puedes generar tus keys o seguir administrando.",
+        reply_markup=markup,
+        parse_mode="Markdown"
+    )
 
 # --- COMANDO PRINCIPAL /free ---
 @bot.message_handler(commands=['free', 'start'])
@@ -228,12 +292,7 @@ def cmd_free(message):
                 parse_mode="Markdown"
             )
         else:
-            bot.send_message(
-                chat_id,
-                BIOGRAFIA_TEXTO,
-                reply_markup=markup,
-                parse_mode="Markdown"
-            )
+            bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
     except Exception:
         bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup, parse_mode="Markdown")
 
@@ -263,9 +322,9 @@ def procesar_mensajes_y_archivos(message):
             bot.send_message(
                 chat_id,
                 "⚠️ **ID Inválido.**\n\n"
-                "Para obtener tu ID correcto:\n"
+                "Para obtener tu ID numérico correcto:\n"
                 "1. Entra a @userinfobot y presiona /start.\n"
-                "2. Copia el número que dice **Id:** y envíalo aquí.",
+                "2. Copia el número de **Id:** y envíalo aquí.",
                 parse_mode="Markdown"
             )
             return
@@ -319,7 +378,7 @@ def procesar_mensajes_y_archivos(message):
             f"🏷 **ID de Registro:** `#{pack_code}`\n\n"
             "📥 **Envía tus datos:**\n"
             "• Adjunta un **archivo `.txt`** con todas tus líneas.\n"
-            "• O pega las líneas directamente en un mensaje."
+            "• O pega las líneas en un mensaje."
         )
         bot.send_message(chat_id, txt, parse_mode="Markdown")
         return
@@ -437,7 +496,6 @@ def procesar_mensajes_y_archivos(message):
             conn.commit()
             conn.close()
 
-        # Notificar al Storage
         try:
             bot.send_message(
                 STORAGE_CHAT_ID,
