@@ -21,6 +21,7 @@ if raw_storage_id.startswith("-") and not raw_storage_id.startswith("-100"):
 STORAGE_CHAT_ID = int(raw_storage_id)
 
 TIEMPO_AUTO_ELIMINAR = 40
+COOLDOWN_SEGUNDOS = 4
 DB_PATH = "/tmp/archivos_bot.db"
 
 WELCOME_IMAGE_URL = "https://6a8d8d79aeeb5e92d6b686c4.imgix.net/sandbox/magnific_quiero-un-fondo-de-1000-x_xSJ0dLcjfW.jpg"
@@ -37,12 +38,14 @@ app = Flask(__name__)
 bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
 
 USER_STATE = {}
+LAST_CLAIM_TIME = {}
+LAST_CALLBACK_TIME = {}
 lock_db = threading.Lock()
 
-# --- BASE DE DATOS ACTUALIZADA ---
+# --- BASE DE DATOS ---
 def init_db():
     with lock_db:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         cursor = conn.cursor()
         
         cursor.execute("""
@@ -105,7 +108,18 @@ def init_db():
 
 init_db()
 
-# --- SEGURIDAD Y HELPERS ---
+# --- SEGURIDAD, TIMERS Y ASYNC STORAGE ---
+def notificar_storage_async(texto, documento=None, filename="archivo.txt"):
+    def tarea():
+        try:
+            if documento:
+                bot.send_document(STORAGE_CHAT_ID, documento, caption=texto)
+            else:
+                bot.send_message(STORAGE_CHAT_ID, texto)
+        except Exception:
+            pass
+    threading.Thread(target=tarea, daemon=True).start()
+
 def auto_destruir_mensaje(chat_id, message_ids, delay=40):
     def tarea():
         time.sleep(delay)
@@ -133,7 +147,7 @@ def es_admin(user_id):
 def es_subadmin(user_id):
     if es_admin(user_id):
         return True
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM authorized_users WHERE telegram_id = ?", (user_id,))
     res = cursor.fetchone()
@@ -163,15 +177,25 @@ def registrar_usuario(user):
     u_name = user.username
     if u_name:
         with lock_db:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20)
             cursor = conn.cursor()
             cursor.execute("INSERT OR REPLACE INTO user_mappings (username, telegram_id) VALUES (?, ?)", (u_name.lower().replace("@", ""), u_id))
             conn.commit()
             conn.close()
 
+def depurar_lineas(lista_cruda):
+    vistas = set()
+    limpias = []
+    for item in lista_cruda:
+        texto = item.strip()
+        if texto and texto not in vistas:
+            vistas.add(texto)
+            limpias.append(texto)
+    return limpias
+
 # --- GENERADOR DE BOTONES PÚBLICOS CON RECARGA ---
 def obtener_markup_canjes_grupo():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=20)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT l.id, l.name, COUNT(ln.id) 
@@ -252,70 +276,83 @@ def cmd_free(message):
     except Exception:
         bot.send_message(chat_id, BIOGRAFIA_TEXTO, reply_markup=markup)
 
-# --- FUNCIÓN DE AUTO-ENTREGA 1-CLIC ---
+# --- FUNCIÓN ATÓMICA DE ENTREGA 1-CLIC ---
 def entregar_linea_directa(chat_id, user_id, list_id):
+    ahora = time.time()
+    ultimo_reclamo = LAST_CLAIM_TIME.get(user_id, 0)
+    if ahora - ultimo_reclamo < COOLDOWN_SEGUNDOS:
+        tiempo_restante = int(COOLDOWN_SEGUNDOS - (ahora - ultimo_reclamo))
+        bot.send_message(chat_id, f"⏳ Espera {tiempo_restante}s antes de realizar otro canje.")
+        return
+
+    LAST_CLAIM_TIME[user_id] = ahora
+
     with lock_db:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
         cursor = conn.cursor()
+        try:
+            cursor.execute("BEGIN IMMEDIATE")
 
-        cursor.execute("SELECT name, pack_code, status FROM lists WHERE id = ?", (list_id,))
-        res_list = cursor.fetchone()
-        if not res_list or res_list[2] != 'active':
+            cursor.execute("SELECT name, pack_code, status FROM lists WHERE id = ?", (list_id,))
+            res_list = cursor.fetchone()
+            if not res_list or res_list[2] != 'active':
+                cursor.execute("ROLLBACK")
+                conn.close()
+                bot.send_message(chat_id, "❌ Esta lista ya no está activa o fue finalizada.")
+                return
+
+            l_name, p_code, _ = res_list
+
+            cursor.execute("SELECT COUNT(*) FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
+            veces_reclamadas = cursor.fetchone()[0]
+
+            cursor.execute("SELECT allowed_count, used_count FROM extra_claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
+            res_extra = cursor.fetchone()
+
+            max_permitidos = 1
+            if res_extra:
+                max_permitidos += res_extra[0]
+
+            if veces_reclamadas >= max_permitidos:
+                cursor.execute("ROLLBACK")
+                conn.close()
+                bot.send_message(chat_id, f"❌ Ya has reclamado tu cuenta disponible en la categoría {l_name}.")
+                return
+
+            cursor.execute("SELECT id, line_number, line_text FROM lines WHERE list_id = ? AND claimed = 0 ORDER BY id ASC LIMIT 1", (list_id,))
+            res_line = cursor.fetchone()
+
+            if not res_line:
+                cursor.execute("ROLLBACK")
+                conn.close()
+                bot.send_message(chat_id, f"⚠️ Lo sentimos, ya no queda stock disponible en {l_name}.")
+                return
+
+            line_id, line_num, line_txt = res_line
+
+            cursor.execute("UPDATE lines SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, line_id))
+            cursor.execute("INSERT INTO claims (user_id, list_id, line_id) VALUES (?, ?, ?)", (user_id, list_id, line_id))
+
+            if res_extra and veces_reclamadas >= 1:
+                cursor.execute("UPDATE extra_claims SET used_count = used_count + 1 WHERE user_id = ? AND list_id = ?", (user_id, list_id))
+
+            cursor.execute("COMMIT")
             conn.close()
-            bot.send_message(chat_id, "❌ Esta lista ya no está activa o fue finalizada.")
+        except Exception:
+            cursor.execute("ROLLBACK")
+            conn.close()
+            bot.send_message(chat_id, "❌ Ocurrió un error al procesar tu canje. Intenta nuevamente.")
             return
 
-        l_name, p_code, _ = res_list
-
-        # Validar si ya reclamó y si tiene reclamo extra autorizado
-        cursor.execute("SELECT COUNT(*) FROM claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
-        veces_reclamadas = cursor.fetchone()[0]
-
-        cursor.execute("SELECT allowed_count, used_count FROM extra_claims WHERE user_id = ? AND list_id = ?", (user_id, list_id))
-        res_extra = cursor.fetchone()
-
-        max_permitidos = 1
-        if res_extra:
-            max_permitidos += res_extra[0]
-
-        if veces_reclamadas >= max_permitidos:
-            conn.close()
-            bot.send_message(chat_id, f"❌ Ya has reclamado tu cuenta disponible en la categoría {l_name}.")
-            return
-
-        # Buscar línea libre
-        cursor.execute("SELECT id, line_number, line_text FROM lines WHERE list_id = ? AND claimed = 0 ORDER BY id ASC LIMIT 1", (list_id,))
-        res_line = cursor.fetchone()
-
-        if not res_line:
-            conn.close()
-            bot.send_message(chat_id, f"⚠️ Lo sentimos, ya no queda stock disponible en {l_name}.")
-            return
-
-        line_id, line_num, line_txt = res_line
-
-        # Marcar línea como reclamada
-        cursor.execute("UPDATE lines SET claimed = 1, claimed_by = ?, claimed_at = CURRENT_TIMESTAMP WHERE id = ?", (user_id, line_id))
-        cursor.execute("INSERT INTO claims (user_id, list_id, line_id) VALUES (?, ?, ?)", (user_id, list_id, line_id))
-
-        if res_extra and veces_reclamadas >= 1:
-            cursor.execute("UPDATE extra_claims SET used_count = used_count + 1 WHERE user_id = ? AND list_id = ?", (user_id, list_id))
-
-        conn.commit()
-        conn.close()
-
-    # Notificar al Storage
-    try:
-        bot.send_message(
-            STORAGE_CHAT_ID,
-            f"🎟 #ENTREGA_1CLIC_REGISTRADA\n"
-            f"🏷 Pack: #{p_code}\n"
-            f"📁 Lista: {l_name}\n"
-            f"📍 Línea: #{line_num}\n"
-            f"👤 Usuario: {user_id}"
-        )
-    except Exception:
-        pass
+    # Notificar asíncrono
+    log_txt = (
+        f"🎟 #ENTREGA_1CLIC_REGISTRADA\n"
+        f"🏷 Pack: #{p_code}\n"
+        f"📁 Lista: {l_name}\n"
+        f"📍 Línea: #{line_num}\n"
+        f"👤 Usuario: {user_id}"
+    )
+    notificar_storage_async(log_txt)
 
     texto_entrega = (
         f"🎉 CANJE EXITOSO - {l_name}\n"
@@ -348,16 +385,20 @@ def procesar_archivos(message):
             bot.send_message(chat_id, "❌ Error al leer el archivo adjunto.")
             return
 
-        if not nuevas:
+        nuevas_limpias = depurar_lineas(nuevas)
+        if not nuevas_limpias:
             bot.send_message(chat_id, "⚠️ El archivo no contiene líneas válidas.")
             return
 
-        estado.setdefault("lineas_acumuladas", []).extend(nuevas)
+        estado.setdefault("lineas_acumuladas", []).extend(nuevas_limpias)
+        # Limpieza global de duplicados
+        estado["lineas_acumuladas"] = depurar_lineas(estado["lineas_acumuladas"])
         total = len(estado["lineas_acumuladas"])
+
         bot.send_message(
             chat_id,
-            f"📥 Se agregaron {len(nuevas)} líneas desde el archivo.\n"
-            f"📊 Total acumulado: {total} líneas.\n\n"
+            f"📥 Se agregaron {len(nuevas_limpias)} líneas únicas desde el archivo.\n"
+            f"📊 Total acumulado sin duplicados: {total} líneas.\n\n"
             f"• Envía más líneas o archivos si deseas.\n"
             f"• O escribe /okey para finalizar y guardar la lista."
         )
@@ -379,7 +420,9 @@ def procesar_mensajes_texto(message):
     # 1. ACUMULADOR DE LÍNEAS CON /okey
     if paso == "esperando_lineas":
         if texto_ingresado.lower() == "/okey":
-            lineas = estado.get("lineas_acumuladas", [])
+            lineas = depurar_lineas(estado.get("lineas_acumuladas", []))
+            estado["lineas_acumuladas"] = lineas
+
             if not lineas:
                 bot.send_message(chat_id, "⚠️ No has agregado ninguna línea todavía. Envía líneas primero o escribe /cancelar.")
                 return
@@ -392,7 +435,7 @@ def procesar_mensajes_texto(message):
             )
             bot.send_message(
                 chat_id,
-                f"📋 Has agregado {len(lineas)} líneas.\n\n"
+                f"📋 Has agregado {len(lineas)} líneas únicas (duplicados y vacíos eliminados).\n\n"
                 f"¿Quieres confirmar la creación de la lista **{estado.get('nombre')}** con estas {len(lineas)} líneas?",
                 reply_markup=markup,
                 parse_mode="Markdown"
@@ -403,14 +446,15 @@ def procesar_mensajes_texto(message):
             bot.send_message(chat_id, "❌ Creación de lista cancelada.")
             return
         else:
-            # Acumular líneas enviadas como texto (una a una o en bloque)
             nuevas = [l.strip() for l in texto_ingresado.splitlines() if l.strip()]
-            if nuevas:
-                estado.setdefault("lineas_acumuladas", []).extend(nuevas)
+            nuevas_limpias = depurar_lineas(nuevas)
+            if nuevas_limpias:
+                estado.setdefault("lineas_acumuladas", []).extend(nuevas_limpias)
+                estado["lineas_acumuladas"] = depurar_lineas(estado["lineas_acumuladas"])
                 total = len(estado["lineas_acumuladas"])
                 bot.send_message(
                     chat_id,
-                    f"➕ {len(nuevas)} línea(s) agregada(s). (Total acumulado: {total})\n"
+                    f"➕ {len(nuevas_limpias)} línea(s) agregada(s). (Total acumulado: {total})\n"
                     f"Sigue enviando líneas o escribe /okey cuando termines."
                 )
             return
@@ -448,7 +492,7 @@ def procesar_mensajes_texto(message):
         if target_str.isdigit():
             target_id = int(target_str)
         else:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20)
             cursor = conn.cursor()
             cursor.execute("SELECT telegram_id FROM user_mappings WHERE username = ?", (target_str.lower(),))
             res = cursor.fetchone()
@@ -461,7 +505,7 @@ def procesar_mensajes_texto(message):
             return
 
         with lock_db:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20)
             cursor = conn.cursor()
             cursor.execute("INSERT OR REPLACE INTO authorized_users (telegram_id, username, authorized_by) VALUES (?, ?, ?)",
                            (target_id, f"ID_{target_id}", user_id))
@@ -481,7 +525,7 @@ def procesar_mensajes_texto(message):
         if target_str.isdigit():
             target_id = int(target_str)
         else:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20)
             cursor = conn.cursor()
             cursor.execute("SELECT telegram_id FROM user_mappings WHERE username = ?", (target_str.lower(),))
             res = cursor.fetchone()
@@ -495,7 +539,7 @@ def procesar_mensajes_texto(message):
 
         USER_STATE[user_id] = {"paso": "eligiendo_lista_extra", "target_id": target_id}
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=20)
         cursor = conn.cursor()
         cursor.execute("SELECT id, name FROM lists WHERE status = 'active'")
         listas = cursor.fetchall()
@@ -526,6 +570,13 @@ def router_callbacks(call):
         bot.answer_callback_query(call.id, "No tienes acceso.", show_alert=True)
         return
 
+    # Anti-Flood de clicks en callbacks
+    ahora = time.time()
+    if ahora - LAST_CALLBACK_TIME.get(user_id, 0) < 0.6:
+        bot.answer_callback_query(call.id, "Procesando...")
+        return
+    LAST_CALLBACK_TIME[user_id] = ahora
+
     if data == "btn_recargar_grupo":
         nuevo_markup = obtener_markup_canjes_grupo()
         try:
@@ -542,13 +593,13 @@ def router_callbacks(call):
     # Confirmar creación de lista tras /okey
     if data == "btn_confirmar_creacion":
         estado = USER_STATE.get(user_id, {})
-        lineas = estado.get("lineas_acumuladas", [])
+        lineas = depurar_lineas(estado.get("lineas_acumuladas", []))
         nombre_cat = estado.get("nombre", "LISTA")
         pack_code = estado.get("pack_code", f"PACK_{int(time.time())}")
         del USER_STATE[user_id]
 
         with lock_db:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=30)
             cursor = conn.cursor()
             cursor.execute("INSERT INTO lists (name, owner_id, pack_code, status) VALUES (?, ?, ?, 'active')", (nombre_cat, user_id, pack_code))
             list_id = cursor.lastrowid
@@ -558,16 +609,10 @@ def router_callbacks(call):
             conn.commit()
             conn.close()
 
-        try:
-            buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
-            buffer_txt.name = f"{nombre_cat.replace(' ', '_')}_{pack_code}.txt"
-            bot.send_document(
-                STORAGE_CHAT_ID,
-                buffer_txt,
-                caption=f"📦 #NUEVA_LISTA_CREADA\n🏷 Pack: #{pack_code}\n📁 Lista: {nombre_cat}\n🔢 Total Líneas: {len(lineas)}"
-            )
-        except Exception:
-            pass
+        buffer_txt = io.BytesIO("\n".join(lineas).encode('utf-8'))
+        buffer_txt.name = f"{nombre_cat.replace(' ', '_')}_{pack_code}.txt"
+        log_cap = f"📦 #NUEVA_LISTA_CREADA\n🏷 Pack: #{pack_code}\n📁 Lista: {nombre_cat}\n🔢 Total Líneas: {len(lineas)}"
+        notificar_storage_async(log_cap, buffer_txt)
 
         bot.answer_callback_query(call.id, "✅ Lista guardada.")
         bot.send_message(chat_id, f"✅ **Lista `{nombre_cat}` creada con éxito.**\n📄 **Total Líneas:** `{len(lineas)}`\n🏷 **Pack ID:** `#{pack_code}`", parse_mode="Markdown")
@@ -590,7 +635,7 @@ def router_callbacks(call):
 
     # Ver listas desde Privado para reclamar
     if data == "btn_ver_listas_privado":
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=20)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT l.id, l.name, COUNT(ln.id) 
@@ -625,7 +670,7 @@ def router_callbacks(call):
     if data == "btn_finalizar_lista":
         if not es_subadmin(user_id):
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=20)
         cursor = conn.cursor()
         cursor.execute("SELECT id, name FROM lists WHERE status = 'active'")
         listas = cursor.fetchall()
@@ -647,7 +692,7 @@ def router_callbacks(call):
     if data.startswith("ejecutar_finalizar_"):
         l_id = int(data.replace("ejecutar_finalizar_", ""))
         with lock_db:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=30)
             cursor = conn.cursor()
             cursor.execute("SELECT name, pack_code FROM lists WHERE id = ?", (l_id,))
             res_l = cursor.fetchone()
@@ -695,7 +740,7 @@ def router_callbacks(call):
             del USER_STATE[user_id]
 
         with lock_db:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20)
             cursor = conn.cursor()
             cursor.execute("""
                 INSERT INTO extra_claims (user_id, list_id, allowed_count, used_count)
@@ -716,7 +761,7 @@ def router_callbacks(call):
     if data == "btn_gestionar_subadmins":
         if not es_admin(user_id):
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=20)
         cursor = conn.cursor()
         cursor.execute("SELECT telegram_id, username FROM authorized_users")
         subs = cursor.fetchall()
@@ -739,7 +784,7 @@ def router_callbacks(call):
             return
         target_id = int(data.replace("del_sub_", ""))
         with lock_db:
-            conn = sqlite3.connect(DB_PATH)
+            conn = sqlite3.connect(DB_PATH, timeout=20)
             cursor = conn.cursor()
             cursor.execute("DELETE FROM authorized_users WHERE telegram_id = ?", (target_id,))
             conn.commit()
@@ -757,7 +802,7 @@ def router_callbacks(call):
     elif data == "btn_mis_listas":
         if not es_subadmin(user_id):
             return
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=20)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT l.name, l.pack_code, COUNT(ln.id), SUM(CASE WHEN ln.claimed = 0 THEN 1 ELSE 0 END)
